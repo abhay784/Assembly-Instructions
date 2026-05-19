@@ -8,6 +8,9 @@ Usage:
   # Run with synthesized ECO from model diff
   python pipeline.py --before-model old.sldprt --after-model new.sldprt --instructions instructions.txt
 
+  # With PDF instructions (auto-extracts text)
+  python pipeline.py --before-model old.sldasm --after-model new.sldasm --instructions instructions.pdf
+
   # Publish after engineer completes review
   python pipeline.py --publish <run_id>
 
@@ -49,6 +52,23 @@ from stages import (
 _STATE_DIR = ".pipeline_state"
 
 
+def _load_instructions(path: str) -> str:
+    """Load instruction text from .txt or .pdf file."""
+    file_path = Path(path)
+
+    if file_path.suffix.lower() == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise RuntimeError("pypdf not installed. Run: pip install pypdf")
+
+        reader = PdfReader(file_path)
+        text = "\n".join(page.extract_text() for page in reader.pages)
+        return text
+    else:
+        return file_path.read_text()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Assembly Instructions AI Agent")
     parser.add_argument("--eco", help="Path to ECO JSON file")
@@ -86,7 +106,7 @@ def main():
     print(f"  Stage 0: {len(ecos)} ECO(s) loaded")
 
     # Stage 1 — Instruction Parser
-    raw_text = Path(args.instructions).read_text()
+    raw_text = _load_instructions(args.instructions)
     steps = _run_stage(run_id, "1_instruction_parser", lambda: instruction_parser.run(raw_text, llm))
     print(f"  Stage 1: {len(steps)} steps parsed")
 
