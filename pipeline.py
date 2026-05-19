@@ -212,6 +212,19 @@ def _publish(run_id: str, output_dir: str):
     )
     print(f"Published: {outputs['pdf']}")
 
+    # Collect approved revisions as fine-tuning training data
+    from finetune.collector import collect_approved_examples, count_examples
+    from finetune.metrics import record_run_metrics
+
+    training_path = Path("training_data.jsonl")
+    model_used = os.environ.get("FINETUNED_MODEL") or os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+    new = collect_approved_examples(run_id, output_dir, training_path)
+    total = count_examples(training_path)
+    record_run_metrics(run_id, model_used, review["flagged_steps"])
+    print(f"  Learning: collected {new} new training example(s). Total: {total}")
+    if total >= 100:
+        print("  Run `python -m finetune.trainer` to start fine-tuning.")
+
 
 def _apply_reviewer_edits(html: str, review: dict) -> str:
     # Simple pass for now: reviewer edits live in review_required.json
