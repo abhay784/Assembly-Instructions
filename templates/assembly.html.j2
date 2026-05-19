@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Assembly Instructions</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 10pt;
+    color: #1a1a1a;
+    background: white;
+  }
+
+  /* Page layout for WeasyPrint */
+  @page {
+    size: A4;
+    margin: 20mm 15mm 20mm 15mm;
+    @bottom-center {
+      content: "Page " counter(page) " of " counter(pages);
+      font-size: 8pt;
+      color: #888;
+    }
+  }
+
+  h1 { font-size: 18pt; color: #1a3a5c; margin-bottom: 4pt; }
+  h2 { font-size: 13pt; color: #2e6da4; margin: 16pt 0 6pt; border-bottom: 1.5pt solid #2e6da4; padding-bottom: 3pt; }
+  h3 { font-size: 10pt; font-weight: bold; margin: 10pt 0 4pt; }
+
+  .header {
+    border-bottom: 2pt solid #1a3a5c;
+    padding-bottom: 8pt;
+    margin-bottom: 12pt;
+  }
+
+  .meta {
+    font-size: 8pt;
+    color: #666;
+    margin-top: 4pt;
+  }
+
+  .diff-summary {
+    background: #f0f4f8;
+    border-left: 3pt solid #2e6da4;
+    padding: 8pt 10pt;
+    margin-bottom: 14pt;
+    font-size: 9pt;
+  }
+
+  .diff-summary span { margin-right: 14pt; }
+
+  /* Step card */
+  .step {
+    page-break-inside: avoid;
+    margin-bottom: 14pt;
+    border: 0.5pt solid #ddd;
+    border-radius: 3pt;
+    overflow: hidden;
+  }
+
+  .step-header {
+    background: #f7f9fc;
+    padding: 6pt 10pt;
+    border-bottom: 0.5pt solid #ddd;
+    display: flex;
+    align-items: center;
+    gap: 8pt;
+  }
+
+  .step-number {
+    font-weight: bold;
+    color: #2e6da4;
+    min-width: 22pt;
+  }
+
+  .step-heading { font-weight: bold; flex: 1; }
+
+  .badge {
+    font-size: 7pt;
+    padding: 2pt 5pt;
+    border-radius: 2pt;
+    font-weight: bold;
+    text-transform: uppercase;
+  }
+
+  .badge-revised { background: #fff3cd; color: #856404; }
+  .badge-new     { background: #d1ecf1; color: #0c5460; }
+
+  .step-body {
+    padding: 8pt 10pt;
+    line-height: 1.5;
+  }
+
+  /* Flag banners */
+  .flag-banner {
+    margin: 6pt 0 0;
+    padding: 5pt 8pt;
+    border-radius: 2pt;
+    font-size: 8.5pt;
+  }
+
+  .flag-warning { background: #fff3cd; border-left: 3pt solid #ffc107; color: #664d03; }
+  .flag-info    { background: #e8f4fd; border-left: 3pt solid #0d6efd; color: #084298; }
+
+  .flag-label { font-weight: bold; margin-right: 4pt; }
+
+  /* Manual view placeholder */
+  .manual-view-placeholder {
+    background: #f8d7da;
+    border: 1pt dashed #dc3545;
+    border-radius: 3pt;
+    padding: 12pt;
+    text-align: center;
+    color: #721c24;
+    font-size: 9pt;
+    margin: 8pt 0;
+  }
+
+  /* Step images */
+  .step-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8pt;
+    margin-top: 8pt;
+  }
+
+  .step-image-container {
+    max-width: 48%;
+    text-align: center;
+  }
+
+  .step-image-container img {
+    max-width: 100%;
+    max-height: 120pt;
+    object-fit: contain;
+    border: 0.5pt solid #ddd;
+  }
+
+  .step-image-container .caption {
+    font-size: 7.5pt;
+    color: #555;
+    margin-top: 3pt;
+  }
+
+  /* Callouts */
+  .callout {
+    margin: 6pt 0 0;
+    padding: 5pt 8pt;
+    border-radius: 2pt;
+    font-size: 9pt;
+    font-weight: bold;
+  }
+
+  .callout-attention { background: #fff3cd; border-left: 3pt solid #fd7e14; }
+  .callout-warning   { background: #f8d7da; border-left: 3pt solid #dc3545; }
+  .callout-note      { background: #d1ecf1; border-left: 3pt solid #0dcaf0; }
+
+  /* Specs table */
+  .specs-table {
+    margin-top: 6pt;
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 8.5pt;
+  }
+
+  .specs-table th {
+    background: #f0f4f8;
+    text-align: left;
+    padding: 3pt 6pt;
+    border: 0.5pt solid #ddd;
+    font-weight: bold;
+  }
+
+  .specs-table td {
+    padding: 3pt 6pt;
+    border: 0.5pt solid #ddd;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Assembly Instructions</h1>
+  <div class="meta">
+    Run ID: {{ run_id }} &nbsp;|&nbsp; Generated: {{ generated_at }}
+  </div>
+</div>
+
+{% if diff_summary.total_modified > 0 or diff_summary.total_added > 0 %}
+<div class="diff-summary">
+  <strong>ECO Update Summary:</strong>
+  <span>{{ diff_summary.total_modified }} step(s) revised</span>
+  <span>{{ diff_summary.total_added }} step(s) added</span>
+  <span>{{ diff_summary.total_unchanged }} step(s) unchanged</span>
+  {% if diff_summary.total_flags > 0 %}
+  <span style="color:#856404;"><strong>⚠ {{ diff_summary.total_flags }} flag(s) require review</strong></span>
+  {% endif %}
+</div>
+{% endif %}
+
+{% for section_name, steps in sections.items() %}
+<h2>{{ section_name }}</h2>
+
+{% for step in steps %}
+<div class="step">
+  <div class="step-header">
+    <span class="step-number">{{ step.step_number }}</span>
+    <span class="step-heading">{{ step.heading }}</span>
+    {% if step.is_new %}
+    <span class="badge badge-new">New</span>
+    {% elif step.is_revised %}
+    <span class="badge badge-revised">Revised</span>
+    {% endif %}
+  </div>
+
+  <div class="step-body">
+    {{ step.body_text | replace('\n', '<br>') }}
+
+    {# Callouts #}
+    {% for callout in step.callouts %}
+    <div class="callout callout-{{ callout.type }}">
+      {{ callout.type | upper }}: {{ callout.text }}
+    </div>
+    {% endfor %}
+
+    {# Specs table #}
+    {% if step.specs %}
+    <table class="specs-table">
+      <tr><th>Specification</th><th>Value</th><th>Unit</th></tr>
+      {% for spec in step.specs %}
+      <tr>
+        <td>{{ spec.key }}</td>
+        <td>{{ spec.value }}</td>
+        <td>{{ spec.unit or '' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    {# Manual view placeholder #}
+    {% if step.needs_manual_view %}
+    <div class="manual-view-placeholder">
+      ⚠ Render Required — New Composer view must be authored manually for this step.
+      View ID: {{ step.step_id }}
+    </div>
+    {% endif %}
+
+    {# Images #}
+    {% if step.images and not step.needs_manual_view %}
+    <div class="step-images">
+      {% for img in step.images %}
+      <div class="step-image-container">
+        {% set src = img.resolved_path if img.resolved_path is defined else img.image_id %}
+        <img src="{{ src }}" alt="{{ img.caption or step.heading }}">
+        {% if img.caption %}
+        <div class="caption">{{ img.caption }}</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {# Eval flags #}
+    {% for flag in step.eval_flags %}
+    <div class="flag-banner flag-{{ flag.severity }}">
+      <span class="flag-label">{{ flag.flag_type | replace('_', ' ') | upper }}:</span>
+      {{ flag.detail }}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+{% endfor %}
+
+</body>
+</html>

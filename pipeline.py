@@ -1,0 +1,280 @@
+"""
+Assembly Instructions AI Agent — Main Pipeline CLI
+
+Usage:
+  # Run full pipeline with real ECO
+  python pipeline.py --eco eco.json --instructions instructions.txt
+
+  # Run with synthesized ECO from model diff
+  python pipeline.py --before-model old.sldprt --after-model new.sldprt --instructions instructions.txt
+
+  # Publish after engineer completes review
+  python pipeline.py --publish <run_id>
+
+Environment variables:
+  LLM_BACKEND          vllm (default) | claude
+  VLLM_BASE_URL        e.g. http://localhost:8001/v1
+  VLLM_MODEL           model name served by vLLM
+  ANTHROPIC_API_KEY    required if LLM_BACKEND=claude
+  CLAUDE_MODEL         defaults to claude-opus-4-7
+  SOLIDWORKS_API       defaults to http://localhost:8000
+  PART_HISTORY_DB      path to part history JSON (optional, for testing)
+  MATE_GRAPH_DB        path to mate graph JSON (optional, for testing)
+"""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+load_dotenv()
+from pathlib import Path
+
+from llm import get_client
+from stages import (
+    agent_planner,
+    change_mapper,
+    doc_stitcher,
+    eco_ingest,
+    eval_gate,
+    image_renderer,
+    instruction_parser,
+    pdf_generator,
+    text_revision,
+)
+
+_STATE_DIR = ".pipeline_state"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Assembly Instructions AI Agent")
+    parser.add_argument("--eco", help="Path to ECO JSON file")
+    parser.add_argument("--before-model", help="Path to before SolidWorks model (for ECO synthesis)")
+    parser.add_argument("--after-model", help="Path to after SolidWorks model (for ECO synthesis)")
+    parser.add_argument("--instructions", help="Path to raw instruction text or JSON")
+    parser.add_argument("--smg", help="Path to SolidWorks Composer .smg file")
+    parser.add_argument("--document-id", default="document", help="Identifier for this document")
+    parser.add_argument("--output-dir", default="output", help="Directory for final outputs")
+    parser.add_argument("--publish", metavar="RUN_ID", help="Publish after review — regenerate PDF from approved review_required.json")
+    parser.add_argument("--run-id", help="Resume a specific run (skip completed stages)")
+    args = parser.parse_args()
+
+    if args.publish:
+        _publish(args.publish, args.output_dir)
+        return
+
+    if not args.instructions:
+        parser.error("--instructions is required")
+    if not args.eco and not (args.before_model and args.after_model):
+        parser.error("Provide --eco or both --before-model and --after-model")
+
+    run_id = args.run_id or f"{args.document_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    print(f"Run ID: {run_id}")
+
+    llm = get_client()
+    revision_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    # Stage 0 — ECO Ingest
+    ecos = _run_stage(run_id, "0_eco_ingest", lambda: eco_ingest.run(
+        eco_json_path=args.eco,
+        before_model_path=args.before_model,
+        after_model_path=args.after_model,
+    ))
+    print(f"  Stage 0: {len(ecos)} ECO(s) loaded")
+
+    # Stage 1 — Instruction Parser
+    raw_text = Path(args.instructions).read_text()
+    steps = _run_stage(run_id, "1_instruction_parser", lambda: instruction_parser.run(raw_text, llm))
+    print(f"  Stage 1: {len(steps)} steps parsed")
+
+    # Stage 2 — Change Mapper
+    affected = _run_stage(run_id, "2_change_mapper", lambda: change_mapper.run(steps, ecos))
+    print(f"  Stage 2: {len(affected)} affected step(s)")
+
+    # Stage 3 — Agent Planner
+    plans = _run_stage(run_id, "3_agent_planner", lambda: agent_planner.run(affected, ecos, steps, llm))
+    print(f"  Stage 3: {len(plans)} action plan(s)")
+
+    # Stage 4 — Text Revision
+    revised = _run_stage(run_id, "4_text_revision", lambda: text_revision.run(plans, steps, ecos, llm))
+    print(f"  Stage 4: {len(revised)} step(s) revised")
+
+    # Stage 5 — Image Renderer
+    rendered = _run_stage(run_id, "5_image_renderer", lambda: image_renderer.run(
+        action_plans=plans,
+        revised_steps=revised,
+        document_id=args.document_id,
+        revision_id=revision_id,
+        smg_path=args.smg or "",
+        new_cad_path=args.after_model or "",
+    ))
+    print(f"  Stage 5: {sum(1 for r in rendered if not r.skipped)} image(s) rendered")
+
+    # Stage 6 — Eval Gate
+    evaluated = _run_stage(run_id, "6_eval_gate", lambda: eval_gate.run(
+        revised_steps=revised,
+        rendered_images=rendered,
+        ecos=ecos,
+        original_steps=steps,
+        llm=llm,
+    ))
+    flagged = sum(1 for e in evaluated if e.eval_flags)
+    print(f"  Stage 6: {flagged} step(s) flagged")
+
+    # Stage 7 — Document Stitcher
+    eco_ids = [eco.eco_id for eco in ecos]
+    html, diff = _run_stage(run_id, "7_doc_stitcher", lambda: doc_stitcher.run(
+        original_steps=steps,
+        evaluated_steps=evaluated,
+        action_plans=plans,
+        run_id=run_id,
+        eco_ids=eco_ids,
+    ))
+    print(f"  Stage 7: HTML assembled, {diff['summary']['total_flags']} flag(s) in diff")
+
+    # Stage 8 — PDF Generator
+    outputs = pdf_generator.run(
+        rendered_html=html,
+        evaluated_steps=evaluated,
+        diff=diff,
+        output_dir=args.output_dir,
+        run_id=run_id,
+    )
+
+    print(f"\nOutputs written to {args.output_dir}/")
+    print(f"  PDF:    {outputs['pdf']}")
+    print(f"  Diff:   {outputs['diff_json']}")
+    print(f"  Review: {outputs['review_json']}")
+
+    review_count = len(json.loads(Path(outputs["review_json"]).read_text())["flagged_steps"])
+    if review_count:
+        print(f"\n⚠  {review_count} step(s) require engineer review.")
+        print(f"   Edit {outputs['review_json']} and run:")
+        print(f"   python pipeline.py --publish {run_id}")
+
+
+def _publish(run_id: str, output_dir: str):
+    """Re-render PDF after engineer approves review_required.json."""
+    review_path = Path(output_dir) / "review_required.json"
+    if not review_path.exists():
+        print(f"Error: {review_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    review = json.loads(review_path.read_text())
+    unapproved = [s for s in review["flagged_steps"] if not s.get("approved")]
+    if unapproved:
+        print(f"⚠  {len(unapproved)} step(s) not yet approved:")
+        for s in unapproved:
+            print(f"   - {s['step_id']}: {[f['flag_type'] for f in s['flags']]}")
+        confirm = input("Publish anyway? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Publish cancelled.")
+            return
+
+    # Reload state from checkpoint and regenerate HTML/PDF with reviewer edits applied
+    state = _load_stage(run_id, "7_doc_stitcher")
+    if not state:
+        print(f"Error: no checkpoint found for run {run_id}", file=sys.stderr)
+        sys.exit(1)
+
+    html, diff = state
+    _apply_reviewer_edits(html, review)
+
+    outputs = pdf_generator.run(
+        rendered_html=html,
+        evaluated_steps=[],
+        diff=diff,
+        output_dir=output_dir,
+        run_id=run_id,
+    )
+    print(f"Published: {outputs['pdf']}")
+
+
+def _apply_reviewer_edits(html: str, review: dict) -> str:
+    # Simple pass for now: reviewer edits live in review_required.json
+    # A full implementation would substitute approved revised text back into HTML
+    return html
+
+
+def _stage_path(run_id: str, stage_name: str) -> Path:
+    return Path(_STATE_DIR) / run_id / f"{stage_name}.json"
+
+
+def _run_stage(run_id: str, stage_name: str, fn):
+    path = _stage_path(run_id, stage_name)
+    if path.exists():
+        print(f"  Stage {stage_name}: loaded from checkpoint")
+        data = json.loads(path.read_text())
+        return _deserialize_stage(stage_name, data)
+
+    result = fn()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(_serialize_stage(stage_name, result), f)
+    return result
+
+
+def _load_stage(run_id: str, stage_name: str):
+    path = _stage_path(run_id, stage_name)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    return _deserialize_stage(stage_name, data)
+
+
+def _serialize_stage(stage_name: str, data):
+    from schemas.eco import ECO
+    from schemas.instruction import Step
+    from schemas.pipeline_state import (
+        ActionPlan,
+        AffectedStep,
+        EvaluatedStep,
+        RenderedImage,
+        RevisedStep,
+    )
+
+    if isinstance(data, list):
+        if data and hasattr(data[0], "model_dump"):
+            return [item.model_dump() for item in data]
+    if isinstance(data, tuple):
+        html, diff = data
+        return {"html": html, "diff": diff}
+    return data
+
+
+def _deserialize_stage(stage_name: str, data):
+    from schemas.eco import ECO
+    from schemas.instruction import Step
+    from schemas.pipeline_state import (
+        ActionPlan,
+        AffectedStep,
+        EvaluatedStep,
+        RenderedImage,
+        RevisedStep,
+    )
+
+    schema_map = {
+        "0_eco_ingest": ECO,
+        "1_instruction_parser": Step,
+        "2_change_mapper": AffectedStep,
+        "3_agent_planner": ActionPlan,
+        "4_text_revision": RevisedStep,
+        "5_image_renderer": RenderedImage,
+        "6_eval_gate": EvaluatedStep,
+    }
+
+    if stage_name in schema_map:
+        model = schema_map[stage_name]
+        return [model.model_validate(item) for item in data]
+
+    if stage_name == "7_doc_stitcher":
+        return data["html"], data["diff"]
+
+    return data
+
+
+if __name__ == "__main__":
+    main()

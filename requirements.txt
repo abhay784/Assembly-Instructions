@@ -1,0 +1,24 @@
+# Core
+pydantic>=2.0
+httpx>=0.27
+
+# LLM clients
+openai>=1.30        # used by VLLMClient (OpenAI-compatible vLLM endpoint)
+anthropic>=0.28     # used by ClaudeClient
+
+# Document generation
+weasyprint>=62.0
+jinja2>=3.1
+
+# PDF parsing (for extracting raw text from input PDFs)
+pypdf>=4.0
+
+# SolidWorks model property reading (no COM required)
+olefile>=0.47
+
+# Environment
+python-dotenv>=1.0
+
+# Development / testing
+pytest>=8.0
+pytest-mock>=3.12
