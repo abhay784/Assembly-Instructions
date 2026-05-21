@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from weasyprint import HTML
+from playwright.sync_api import sync_playwright
 
 from schemas.pipeline_state import EvaluatedStep, ReviewItem
 
@@ -33,7 +33,12 @@ def run(
     review_path = str(out / "review_required.json")
 
     # Generate PDF
-    HTML(string=rendered_html, base_url=str(Path.cwd())).write_pdf(pdf_path)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.set_content(rendered_html)
+        page.pdf(path=pdf_path, print_background=True)
+        browser.close()
 
     # Write diff.json
     with open(diff_path, "w") as f:

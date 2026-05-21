@@ -72,8 +72,11 @@ def _com_diff(before_path: str, after_path: str) -> list[ECO]:
 
 def _property_diff(before_path: str, after_path: str) -> list[ECO]:
     """
-    Lightweight diff using OLE custom properties — no SolidWorks required.
-    Extracts part number, description, revision, and material from file metadata.
+    Lightweight diff without SolidWorks — two passes:
+    1. OLE custom property diff (revision, description, part number).
+    2. Part-reference diff: scans the SLDASM binary for embedded component
+       filenames (*.SLDPRT / *.SLDASM) and generates one ECO per added,
+       removed, or renamed part.
     """
     try:
         import olefile  # type: ignore
@@ -86,22 +89,62 @@ def _property_diff(before_path: str, after_path: str) -> list[ECO]:
     before_props = _read_ole_properties(before_path)
     after_props = _read_ole_properties(after_path)
 
+    ecos: list[ECO] = []
+
+    # Pass 1 — metadata properties
     part_number = after_props.get("part_number") or Path(after_path).stem
-    changes = _diff_properties(before_props, after_props)
-
-    if not changes:
-        return []
-
-    eco_id = _make_eco_id(before_path, part_number)
-    summary_parts = [f"{c.field}: {c.old!r} → {c.new!r}" for c in changes]
-    return [
-        ECO(
+    prop_changes = _diff_properties(before_props, after_props)
+    if prop_changes:
+        eco_id = _make_eco_id(before_path, part_number)
+        summary_parts = [f"{c.field}: {c.old!r} → {c.new!r}" for c in prop_changes]
+        ecos.append(ECO(
             eco_id=eco_id,
             part_number=part_number,
-            changes=changes,
+            changes=prop_changes,
             summary=f"Synthesized from property diff. Changes: {'; '.join(summary_parts)}",
-        )
-    ]
+        ))
+
+    # Pass 2 — part reference diff
+    ecos.extend(_part_ref_diff(before_path, after_path))
+
+    return ecos
+
+
+def _folder_part_refs(sldasm_path: str) -> set[str]:
+    """Return the set of SLD* filenames in the same directory as the assembly."""
+    exts = {".SLDPRT", ".SLDASM"}
+    return {
+        f.name.upper()
+        for f in Path(sldasm_path).parent.iterdir()
+        if f.suffix.upper() in exts
+    }
+
+
+def _part_ref_diff(before_path: str, after_path: str) -> list[ECO]:
+    before_refs = _folder_part_refs(before_path)
+    after_refs = _folder_part_refs(after_path)
+
+    added = after_refs - before_refs
+    removed = before_refs - after_refs
+
+    ecos: list[ECO] = []
+    for part in sorted(added):
+        eco_id = _make_eco_id(before_path, part)
+        ecos.append(ECO(
+            eco_id=eco_id,
+            part_number=Path(part).stem,
+            changes=[ECOChange(field="part", old="", new=part)],
+            summary=f"Part added to assembly: {part}",
+        ))
+    for part in sorted(removed):
+        eco_id = _make_eco_id(before_path, part)
+        ecos.append(ECO(
+            eco_id=eco_id,
+            part_number=Path(part).stem,
+            changes=[ECOChange(field="part", old=part, new="")],
+            summary=f"Part removed from assembly: {part}",
+        ))
+    return ecos
 
 
 def _read_ole_properties(path: str) -> dict:

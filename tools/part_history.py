@@ -16,7 +16,7 @@ _TOOL_SCHEMA = {
         "Look up the engineering history and known specifications for a part number. "
         "Returns previous ECOs, current dimensions, material, and notes."
     ),
-    "parameters": {
+    "input_schema": {
         "type": "object",
         "properties": {
             "part_number": {

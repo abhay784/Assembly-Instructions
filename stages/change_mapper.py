@@ -33,7 +33,7 @@ def run(
 
     for eco in ecos:
         # Direct impact — step mentions the changed part
-        for step_id in part_to_steps.get(eco.part_number, []):
+        for step_id in part_to_steps.get(_normalize(eco.part_number), []):
             key = (step_id, eco.eco_id)
             if key not in seen:
                 seen.add(key)
@@ -50,7 +50,7 @@ def run(
         if mate_graph:
             mated_parts = mate_graph.get(eco.part_number, [])
             for mated_part in mated_parts:
-                for step_id in part_to_steps.get(mated_part, []):
+                for step_id in part_to_steps.get(_normalize(mated_part), []):
                     key = (step_id, eco.eco_id)
                     if key not in seen:
                         seen.add(key)
@@ -66,16 +66,27 @@ def run(
     return affected
 
 
+def _normalize(s: str) -> str:
+    """Lowercase and strip non-alphanumeric chars for fuzzy matching."""
+    import re
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
 def _build_index(steps: list[Step]) -> dict[str, list[str]]:
-    """Maps part_id (case-insensitive) → list of step_ids that reference it."""
+    """
+    Maps normalized part_id → list of step_ids.
+    Normalization strips spaces/underscores/hyphens so that 'HexBearing',
+    'hex bearing', and 'hex_bearing' all map to the same key.
+    """
     index: dict[str, list[str]] = defaultdict(list)
     for step in steps:
         for part_ref in step.parts_referenced:
-            index[part_ref.part_id.lower()].append(step.step_id)
-        # Also index specs that contain part-number-like values
+            key = _normalize(part_ref.part_id)
+            if key:
+                index[key].append(step.step_id)
         for spec in step.specs:
             if _looks_like_part_number(spec.value):
-                index[spec.value.lower()].append(step.step_id)
+                index[_normalize(spec.value)].append(step.step_id)
     return dict(index)
 
 

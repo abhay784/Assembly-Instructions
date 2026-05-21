@@ -77,6 +77,7 @@ def run(raw_text: str, llm: LLMClient) -> list[Step]:
     response = llm.complete(
         messages=[{"role": "user", "content": raw_text}],
         system=_SYSTEM_PROMPT,
+        max_tokens=32000,
     )
 
     parsed = _parse_json_response(response.content)

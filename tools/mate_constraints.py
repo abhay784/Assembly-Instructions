@@ -19,7 +19,7 @@ _TOOL_SCHEMA = {
         "it is mated to, the mate type (concentric, coincident, etc.), and any "
         "relevant dimensions or tolerances on the constraint."
     ),
-    "parameters": {
+    "input_schema": {
         "type": "object",
         "properties": {
             "part_number": {
