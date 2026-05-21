@@ -18,6 +18,7 @@ class LLMClient(Protocol):
         messages: list[dict],
         system: str,
         tools: list[dict] | None = None,
+        max_tokens: int = 8096,
     ) -> LLMResponse: ...
 
     def stream(

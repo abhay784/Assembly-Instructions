@@ -7,7 +7,7 @@ openai>=1.30        # used by VLLMClient (OpenAI-compatible vLLM endpoint)
 anthropic>=0.28     # used by ClaudeClient
 
 # Document generation
-weasyprint>=62.0
+playwright>=1.44
 jinja2>=3.1
 
 # PDF parsing (for extracting raw text from input PDFs)
