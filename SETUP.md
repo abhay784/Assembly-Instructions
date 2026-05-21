@@ -223,6 +223,67 @@ python pipeline.py --before-model v1.sldasm --after-model v2.sldasm --instructio
 python pipeline.py --publish <run_id_from_first_run>
 ```
 
+## Learning Loop: Fine-Tuning Claude
+
+The pipeline can improve over time by learning from approved revisions. After each `--publish`, approved steps are collected as fine-tuning examples. Once you have ≥100 approved examples, you can retrain Claude on your specific assembly instruction style.
+
+### Automated Collection & Metrics
+
+Every time you publish approved revisions:
+```bash
+python pipeline.py --publish <run_id>
+```
+
+The system automatically:
+1. Collects approved revisions into `training_data.jsonl`
+2. Records metrics (approval rate, confidence, flags) to `run_metrics.jsonl`
+
+View improvement over time:
+```bash
+python -m finetune.metrics
+```
+
+Prints a table showing approval rates and confidence scores grouped by model — lets you compare base Claude vs. your fine-tuned version.
+
+### Fine-Tuning Workflow
+
+Once you have 100+ approved examples:
+
+```bash
+# Split data and start fine-tuning
+python -m finetune.trainer
+```
+
+This will:
+1. Split `training_data.jsonl` into train/val stratified by confidence
+2. Run baseline eval on the validation set with base Claude
+3. Upload training file and start an Anthropic fine-tuning job
+4. Print a job ID — save this
+
+Then, periodically check status:
+```bash
+python -m finetune.trainer --poll <job_id>
+```
+
+When complete:
+1. Prints comparison: baseline vs. fine-tuned model scores
+2. Outputs the fine-tuned model ID
+3. Add to `.env`: `FINETUNED_MODEL=<id>`
+
+Your next pipeline run will automatically use the fine-tuned model. Repeat this cycle every 50–100 new approvals to keep improving.
+
+### Automated Quality Filtering (Optional)
+
+To reduce manual review load, enable auto-approval of high-confidence revisions:
+- Modify `stages/eval_gate.py` to use `finetune.auto_eval.should_auto_approve()` 
+- Steps scoring ≥0.9 spec compliance + ≥4.0 on all LLM judge dimensions skip `review_required.json`
+- Only borderline/uncertain revisions need engineer eyes
+
 ## Questions or Issues?
 
 Check the `.pipeline_state/` directory for intermediate results. Each stage's JSON output can help debug where something went wrong.
+
+For learning-specific issues:
+- `training_data.jsonl` — raw fine-tuning examples (inspect for format errors)
+- `training_data_train.jsonl` / `training_data_val.jsonl` — train/val split (created by trainer)
+- `run_metrics.jsonl` — per-run quality metrics

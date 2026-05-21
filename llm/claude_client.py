@@ -12,7 +12,10 @@ class ClaudeClient:
 
     def __init__(self):
         self._client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self._model = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+        self._model = (
+            os.environ.get("FINETUNED_MODEL")
+            or os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+        )
 
     def complete(
         self,
