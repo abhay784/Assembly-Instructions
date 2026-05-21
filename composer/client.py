@@ -48,6 +48,15 @@ class ComposerClient:
         resp.raise_for_status()
         return resp.json()
 
+    def author_view(self, view_id: str, azimuth: float, elevation: float) -> dict:
+        """Set camera angle for a view (azimuth, elevation in degrees)."""
+        resp = self._client.post(
+            "/author_view",
+            json={"view_id": view_id, "azimuth": azimuth, "elevation": elevation},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def health(self) -> bool:
         try:
             resp = self._client.get("/health", timeout=3.0)

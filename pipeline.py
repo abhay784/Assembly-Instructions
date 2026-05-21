@@ -48,6 +48,8 @@ from stages import (
     pdf_generator,
     text_revision,
 )
+from finetune.angle_optimizer import optimize_angles_for_steps, print_angle_report
+from composer.client import ComposerClient
 
 _STATE_DIR = ".pipeline_state"
 
@@ -117,6 +119,22 @@ def main():
     # Stage 3 — Agent Planner
     plans = _run_stage(run_id, "3_agent_planner", lambda: agent_planner.run(affected, ecos, steps, llm))
     print(f"  Stage 3: {len(plans)} action plan(s)")
+
+    # Stage 3.5 — Angle Optimizer (Phase 3)
+    # Try to auto-calculate optimal camera angles for new/rerendered steps
+    # This reduces manual view authoring by setting needs_manual_view=False when successful
+    try:
+        with ComposerClient() as composer:
+            if composer.health():
+                plans = optimize_angles_for_steps(steps, plans, composer)
+                optimized_count = sum(1 for p in plans if "[angle auto-optimized:" in p.rationale)
+                if optimized_count > 0:
+                    print(f"  Stage 3.5: {optimized_count} angle(s) auto-optimized")
+                    print_angle_report(plans, steps)
+            else:
+                print(f"  Stage 3.5: Composer bridge not available, skipping angle optimization")
+    except Exception as e:
+        print(f"  Stage 3.5: Angle optimization failed ({e}), continuing with manual views")
 
     # Stage 4 — Text Revision
     revised = _run_stage(run_id, "4_text_revision", lambda: text_revision.run(plans, steps, ecos, llm))
@@ -215,6 +233,8 @@ def _publish(run_id: str, output_dir: str):
     # Collect approved revisions as fine-tuning training data
     from finetune.collector import collect_approved_examples, count_examples
     from finetune.metrics import record_run_metrics
+    from finetune.image_rater import collect_image_ratings, print_image_report
+    from finetune.document_evaluator import collect_document_feedback, print_document_report
 
     training_path = Path("training_data.jsonl")
     model_used = os.environ.get("FINETUNED_MODEL") or os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
@@ -222,6 +242,25 @@ def _publish(run_id: str, output_dir: str):
     total = count_examples(training_path)
     record_run_metrics(run_id, model_used, review["flagged_steps"])
     print(f"  Learning: collected {new} new training example(s). Total: {total}")
+
+    # Phase 2: Collect image ratings (0-10 scale + structured feedback)
+    evaluated_steps = _load_stage(run_id, "6_eval_gate")
+    if evaluated_steps:
+        llm = get_client()
+        image_ratings_path = Path(output_dir) / "image_ratings.jsonl"
+        new_ratings = collect_image_ratings(evaluated_steps, image_ratings_path, run_id, llm)
+        print(f"  Images: rated {new_ratings} image(s)")
+        print_image_report(image_ratings_path)
+
+    # Phase 2.5: Collect document-level feedback (consistency, sequence, physics)
+    original_steps = _load_stage(run_id, "1_instruction_parser")
+    if evaluated_steps and original_steps:
+        llm = get_client()
+        doc_feedback_path = Path(output_dir) / "document_feedback.jsonl"
+        new_audits = collect_document_feedback(evaluated_steps, original_steps, doc_feedback_path, run_id, llm)
+        print(f"  Document: audit complete (1 record)")
+        print_document_report(doc_feedback_path)
+
     if total >= 100:
         print("  Run `python -m finetune.trainer` to start fine-tuning.")
 
