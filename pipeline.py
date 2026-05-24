@@ -141,6 +141,7 @@ def main():
     print(f"  Stage 4: {len(revised)} step(s) revised")
 
     # Stage 5 — Image Renderer
+    # Passes original steps so the SolidWorks backend can calculate angles
     rendered = _run_stage(run_id, "5_image_renderer", lambda: image_renderer.run(
         action_plans=plans,
         revised_steps=revised,
@@ -148,6 +149,7 @@ def main():
         revision_id=revision_id,
         smg_path=args.smg or "",
         new_cad_path=args.after_model or "",
+        original_steps=steps,
     ))
     print(f"  Stage 5: {sum(1 for r in rendered if not r.skipped)} image(s) rendered")
 
@@ -174,15 +176,16 @@ def main():
     print(f"  Stage 7: HTML assembled, {diff['summary']['total_flags']} flag(s) in diff")
 
     # Stage 8 — PDF Generator
+    run_output_dir = str(Path(args.output_dir) / run_id)
     outputs = pdf_generator.run(
         rendered_html=html,
         evaluated_steps=evaluated,
         diff=diff,
-        output_dir=args.output_dir,
+        output_dir=run_output_dir,
         run_id=run_id,
     )
 
-    print(f"\nOutputs written to {args.output_dir}/")
+    print(f"\nOutputs written to {run_output_dir}/")
     print(f"  PDF:    {outputs['pdf']}")
     print(f"  Diff:   {outputs['diff_json']}")
     print(f"  Review: {outputs['review_json']}")
@@ -190,15 +193,28 @@ def main():
     review_count = len(json.loads(Path(outputs["review_json"]).read_text())["flagged_steps"])
     if review_count:
         print(f"\n⚠  {review_count} step(s) require engineer review.")
-        print(f"   Edit {outputs['review_json']} and run:")
-        print(f"   python pipeline.py --publish {run_id}")
+        print(f"   Edit {outputs['review_json']}")
+        print(f"   Then publish: python pipeline.py --publish {run_id}")
+
+    try:
+        from finetune.collector import count_examples
+        example_count = count_examples(Path("training_data.jsonl")) if Path("training_data.jsonl").exists() else 0
+    except Exception:
+        example_count = 0
+    print(f"\nLearning: {example_count} approved example(s) collected (need 100 to fine-tune)")
+    if review_count == 0:
+        print("  No flagged steps — run went clean, nothing to approve this cycle")
 
 
 def _publish(run_id: str, output_dir: str):
     """Re-render PDF after engineer approves review_required.json."""
-    review_path = Path(output_dir) / "review_required.json"
+    run_output_dir = Path(output_dir) / run_id
+    review_path = run_output_dir / "review_required.json"
     if not review_path.exists():
-        print(f"Error: {review_path} not found", file=sys.stderr)
+        # Fallback to legacy flat layout for older runs
+        review_path = Path(output_dir) / "review_required.json"
+    if not review_path.exists():
+        print(f"Error: review_required.json not found in {run_output_dir} or {output_dir}", file=sys.stderr)
         sys.exit(1)
 
     review = json.loads(review_path.read_text())
@@ -221,11 +237,12 @@ def _publish(run_id: str, output_dir: str):
     html, diff = state
     _apply_reviewer_edits(html, review)
 
+    publish_output_dir = str(Path(output_dir) / run_id)
     outputs = pdf_generator.run(
         rendered_html=html,
         evaluated_steps=[],
         diff=diff,
-        output_dir=output_dir,
+        output_dir=publish_output_dir,
         run_id=run_id,
     )
     print(f"Published: {outputs['pdf']}")

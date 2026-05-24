@@ -1,0 +1,1 @@
+{"run_id": "openleg_20260521T203206_02b900", "timestamp": "2026-05-21T20:40:38.641222+00:00", "model_used": "claude-sonnet-4-6", "review_required_count": 5, "approved_count": 0, "approval_rate": 0.0, "avg_confidence_score": 0.0, "flag_counts": {"assembly_logic_uncertain": 4}}

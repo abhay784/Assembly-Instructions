@@ -28,12 +28,23 @@ def run(
                 If provided, enables indirect impact detection.
     """
     part_to_steps = _build_index(steps)
+    raw_index = _build_raw_index(steps)
     affected: list[AffectedStep] = []
     seen: set[tuple[str, str]] = set()
 
     for eco in ecos:
-        # Direct impact — step mentions the changed part
-        for step_id in part_to_steps.get(_normalize(eco.part_number), []):
+        # Strategy 1: exact normalized match
+        exact_hits = set(part_to_steps.get(_normalize(eco.part_number), []))
+
+        # Strategy 2: token-overlap fallback for names that differ by prefix/suffix
+        # e.g. 'OpenLeg_Upper_Bracket-1' matches 'Upper Bracket' in steps
+        fuzzy_hits: set[str] = set()
+        for step_id, raw_parts in raw_index.items():
+            if step_id not in exact_hits:
+                if any(_parts_match(eco.part_number, rp) for rp in raw_parts):
+                    fuzzy_hits.add(step_id)
+
+        for step_id in exact_hits | fuzzy_hits:
             key = (step_id, eco.eco_id)
             if key not in seen:
                 seen.add(key)
@@ -67,16 +78,53 @@ def run(
 
 
 def _normalize(s: str) -> str:
-    """Lowercase and strip non-alphanumeric chars for fuzzy matching."""
+    """Lowercase and strip non-alphanumeric chars for exact matching."""
     import re
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
+def _tokenize(s: str) -> set[str]:
+    """
+    Split a part name/number into meaningful tokens for fuzzy overlap matching.
+    Splits on underscores, hyphens, spaces, and CamelCase boundaries.
+    Drops tokens shorter than 3 chars (articles, version suffixes like 'v1').
+    Examples:
+      'OpenLeg_Upper_Bracket-1' → {'openleg', 'upper', 'bracket'}
+      'M5x10 Socket Head Cap Screw' → {'m5x10', 'socket', 'head', 'cap', 'screw'}
+    """
+    import re
+    # Insert space before uppercase runs in CamelCase
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+    # Split on non-alphanumeric
+    tokens = re.split(r"[^a-zA-Z0-9]+", s.lower())
+    # Drop short/numeric-only tokens (version numbers, single letters)
+    return {t for t in tokens if len(t) >= 3 and not t.isdigit()}
+
+
+def _parts_match(eco_part: str, step_part: str) -> bool:
+    """
+    True if eco_part and step_part refer to the same physical part.
+    Uses two strategies:
+      1. Exact normalized match  (fast, handles identical names)
+      2. Token overlap           (handles prefix/suffix mismatches like
+                                  'OpenLeg_Upper_Bracket' vs 'Upper Bracket')
+    """
+    if _normalize(eco_part) == _normalize(step_part):
+        return True
+    eco_tokens = _tokenize(eco_part)
+    step_tokens = _tokenize(step_part)
+    if not eco_tokens or not step_tokens:
+        return False
+    overlap = eco_tokens & step_tokens
+    # Require at least 2 shared tokens OR the smaller set is fully covered
+    smaller = min(len(eco_tokens), len(step_tokens))
+    return len(overlap) >= 2 or (smaller > 0 and len(overlap) / smaller >= 0.6)
+
+
 def _build_index(steps: list[Step]) -> dict[str, list[str]]:
     """
-    Maps normalized part_id → list of step_ids.
-    Normalization strips spaces/underscores/hyphens so that 'HexBearing',
-    'hex bearing', and 'hex_bearing' all map to the same key.
+    Maps normalized part_id → list of step_ids  (used for exact lookup).
+    Also stores raw part_ids per step for token-overlap fallback.
     """
     index: dict[str, list[str]] = defaultdict(list)
     for step in steps:
@@ -88,6 +136,15 @@ def _build_index(steps: list[Step]) -> dict[str, list[str]]:
             if _looks_like_part_number(spec.value):
                 index[_normalize(spec.value)].append(step.step_id)
     return dict(index)
+
+
+def _build_raw_index(steps: list[Step]) -> dict[str, list[str]]:
+    """Maps step_id → raw part_id strings (for token-overlap matching)."""
+    result: dict[str, list[str]] = defaultdict(list)
+    for step in steps:
+        for part_ref in step.parts_referenced:
+            result[step.step_id].append(part_ref.part_id)
+    return dict(result)
 
 
 def _classify_changes(eco: ECO) -> list[str]:

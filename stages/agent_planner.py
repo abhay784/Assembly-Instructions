@@ -23,8 +23,8 @@ _SYSTEM_PROMPT = """You are a mechanical assembly instruction planner. Given a l
 
 Actions:
 - "rewrite_text": Only the instruction prose needs updating (dimension, material, torque value changed). The existing Composer view image is still accurate.
-- "rewrite_text_and_rerender": Both text AND the Composer CAD view image need updating (part geometry changed, mate type changed, or part swap that changes visual appearance).
-- "add_step_flagged": A brand-new part has been added to the assembly with no existing step. A new step must be created. NOTE: In v1, new Composer views cannot be auto-generated — set needs_manual_view=true and flag for engineer.
+- "rewrite_text_and_rerender": Both text AND the Composer CAD view image need updating (part geometry changed, mate type changed, or part swap that changes visual appearance). The existing Composer view_id for this step will be re-rendered automatically — set needs_manual_view=false.
+- "add_step_flagged": A brand-new part has been added to the assembly with no existing step. A new step must be created. In v1, brand-new Composer views cannot be auto-generated — set needs_manual_view=true and flag for engineer.
 - "no_change": This step is only indirectly affected. The existing text and image remain valid.
 
 Output a JSON array where each object has:
@@ -40,7 +40,8 @@ Rules:
 1. Mate constraint changes (mate_type, concentric→coincident, etc.) always require rerender — the geometry relationship is visually different.
 2. Dimension changes only require rerender if the change would visibly affect the CAD view at the assembly level (e.g. a 50mm→200mm shaft change is visible; a 0.1mm tolerance change is not).
 3. If impact is "indirect", lean toward "no_change" unless the ECO summary indicates assembly-level consequences.
-4. Output ONLY valid JSON. No markdown, no explanation."""
+4. needs_manual_view=true is ONLY for "add_step_flagged" (no existing Composer view exists to re-render). For "rewrite_text_and_rerender", always set needs_manual_view=false — the existing view will be updated automatically.
+5. Output ONLY valid JSON. No markdown, no explanation."""
 
 
 def run(

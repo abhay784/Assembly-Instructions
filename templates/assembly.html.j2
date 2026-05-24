@@ -238,16 +238,8 @@
     </table>
     {% endif %}
 
-    {# Manual view placeholder #}
-    {% if step.needs_manual_view %}
-    <div class="manual-view-placeholder">
-      ⚠ Render Required — New Composer view must be authored manually for this step.
-      View ID: {{ step.step_id }}
-    </div>
-    {% endif %}
-
-    {# Images #}
-    {% if step.images and not step.needs_manual_view %}
+    {# Images — show existing image when available; placeholder only when no image exists at all #}
+    {% if step.images %}
     <div class="step-images">
       {% for img in step.images %}
       <div class="step-image-container">
@@ -258,6 +250,11 @@
         {% endif %}
       </div>
       {% endfor %}
+    </div>
+    {% elif step.needs_manual_view %}
+    <div class="manual-view-placeholder">
+      &#9888; Re-render required — Composer view must be updated manually for this step.
+      View ID: {{ step.step_id }}
     </div>
     {% endif %}
 
