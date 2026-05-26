@@ -2,11 +2,14 @@
 Assembly Instructions AI Agent — Main Pipeline CLI
 
 Usage:
-  # Run full pipeline with real ECO
-  python pipeline.py --eco eco.json --instructions instructions.txt
+  # Preferred: let the SolidWorks bridge diff the assemblies for you
+  python pipeline.py --before-model old.sldasm --after-model new.sldasm --instructions instructions.txt
 
-  # Run with synthesized ECO from model diff
-  python pipeline.py --before-model old.sldprt --after-model new.sldprt --instructions instructions.txt
+  # Use a pre-computed diff JSON (bridge already ran, or saved from a prior run)
+  python pipeline.py --diff assembly_diff.json --instructions instructions.txt
+
+  # Hand-authored ECO file
+  python pipeline.py --eco eco.json --instructions instructions.txt
 
   # With PDF instructions (auto-extracts text)
   python pipeline.py --before-model old.sldasm --after-model new.sldasm --instructions instructions.pdf
@@ -20,7 +23,7 @@ Environment variables:
   VLLM_MODEL           model name served by vLLM
   ANTHROPIC_API_KEY    required if LLM_BACKEND=claude
   CLAUDE_MODEL         defaults to claude-opus-4-7
-  SOLIDWORKS_API       defaults to http://localhost:8000
+  SOLIDWORKS_API       defaults to http://localhost:8000  (Composer bridge)
   PART_HISTORY_DB      path to part history JSON (optional, for testing)
   MATE_GRAPH_DB        path to mate graph JSON (optional, for testing)
 """
@@ -73,9 +76,10 @@ def _load_instructions(path: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Assembly Instructions AI Agent")
-    parser.add_argument("--eco", help="Path to ECO JSON file")
-    parser.add_argument("--before-model", help="Path to before SolidWorks model (for ECO synthesis)")
-    parser.add_argument("--after-model", help="Path to after SolidWorks model (for ECO synthesis)")
+    parser.add_argument("--eco", help="Path to hand-authored ECO JSON file")
+    parser.add_argument("--diff", help="Path to a pre-computed SolidWorks diff JSON (from POST /diff)")
+    parser.add_argument("--before-model", help="Path to the old SolidWorks assembly (bridge will diff it)")
+    parser.add_argument("--after-model",  help="Path to the new SolidWorks assembly (bridge will diff it)")
     parser.add_argument("--instructions", help="Path to raw instruction text or JSON")
     parser.add_argument("--smg", help="Path to SolidWorks Composer .smg file")
     parser.add_argument("--document-id", default="document", help="Identifier for this document")
@@ -90,8 +94,9 @@ def main():
 
     if not args.instructions:
         parser.error("--instructions is required")
-    if not args.eco and not (args.before_model and args.after_model):
-        parser.error("Provide --eco or both --before-model and --after-model")
+    has_change_source = args.diff or args.eco or (args.before_model and args.after_model)
+    if not has_change_source:
+        parser.error("Provide --diff, --eco, or both --before-model and --after-model")
 
     run_id = args.run_id or f"{args.document_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
     print(f"Run ID: {run_id}")
@@ -99,11 +104,12 @@ def main():
     llm = get_client()
     revision_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
-    # Stage 0 — ECO Ingest
+    # Stage 0 — ECO / Diff Ingest
     ecos = _run_stage(run_id, "0_eco_ingest", lambda: eco_ingest.run(
         eco_json_path=args.eco,
         before_model_path=args.before_model,
         after_model_path=args.after_model,
+        diff_json_path=args.diff,
     ))
     print(f"  Stage 0: {len(ecos)} ECO(s) loaded")
 

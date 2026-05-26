@@ -260,6 +260,170 @@ def get_mates(part_number: str):
     return {"part_number": part_number, "mates": []}
 
 
+# ---------------------------------------------------------------------------
+# /diff — compare two SolidWorks assemblies and return component-level diff
+# ---------------------------------------------------------------------------
+
+class DiffRequest(BaseModel):
+    before_path: str
+    after_path: str
+
+
+@app.post("/diff")
+def assembly_diff(req: DiffRequest):
+    """
+    Compare two SolidWorks assemblies and return all component differences.
+
+    Response shape:
+      {
+        "before_path": str,
+        "after_path": str,
+        "components_added":   [{"name": str, "quantity": int}],
+        "components_removed": [{"name": str, "quantity": int}],
+        "components_changed": [{
+            "name": str,
+            "quantity_before": int, "quantity_after": int,
+            "property_changes": [{"property": str, "before": str, "after": str}]
+        }]
+      }
+    """
+    try:
+        if _use_com():
+            return _com_assembly_diff(req.before_path, req.after_path)
+        return _folder_assembly_diff(req.before_path, req.after_path)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+def _get_assembly_components(doc) -> dict[str, dict]:
+    """
+    Walk the assembly component tree and return a dict keyed by component
+    filename (upper-cased stem, e.g. 'BEARING_6MM.SLDPRT').
+    Each value: {"quantity": int, "properties": dict[str, str]}.
+    """
+    components: dict[str, dict] = {}
+    try:
+        comp_array = doc.GetComponents(False)  # False = top-level only
+        if not comp_array:
+            return components
+        for comp in comp_array:
+            try:
+                path = comp.GetPathName()
+                if not path:
+                    continue
+                name = Path(path).name.upper()
+                if name not in components:
+                    # Pull custom properties
+                    props: dict[str, str] = {}
+                    try:
+                        mgr = comp.GetModelDoc2().Extension.CustomPropertyManager("")
+                        names = mgr.GetNames()
+                        if names:
+                            for pn in names:
+                                _, _, val, _ = mgr.Get4(pn, False)
+                                props[pn.lower()] = str(val)
+                    except Exception:
+                        pass
+                    components[name] = {"quantity": 0, "properties": props}
+                components[name]["quantity"] += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return components
+
+
+def _com_assembly_diff(before_path: str, after_path: str) -> dict:
+    """Full assembly diff via SolidWorks COM — Windows only."""
+    import win32com.client  # type: ignore
+    sw = win32com.client.Dispatch("SldWorks.Application")
+    sw.Visible = False
+
+    before_doc = sw.OpenDoc6(before_path, 2, 1, "", 0, 0)  # 2 = swDocASSEMBLY
+    after_doc  = sw.OpenDoc6(after_path,  2, 1, "", 0, 0)
+
+    try:
+        before_comps = _get_assembly_components(before_doc)
+        after_comps  = _get_assembly_components(after_doc)
+    finally:
+        try:
+            sw.CloseDoc(before_doc.GetPathName())
+            sw.CloseDoc(after_doc.GetPathName())
+        except Exception:
+            pass
+
+    before_names = set(before_comps)
+    after_names  = set(after_comps)
+
+    added = [
+        {"name": n, "quantity": after_comps[n]["quantity"]}
+        for n in sorted(after_names - before_names)
+    ]
+    removed = [
+        {"name": n, "quantity": before_comps[n]["quantity"]}
+        for n in sorted(before_names - after_names)
+    ]
+    changed = []
+    for name in sorted(before_names & after_names):
+        bc = before_comps[name]
+        ac = after_comps[name]
+        prop_changes = []
+        if bc["quantity"] != ac["quantity"]:
+            prop_changes.append({
+                "property": "quantity",
+                "before": str(bc["quantity"]),
+                "after": str(ac["quantity"]),
+            })
+        all_props = set(bc["properties"]) | set(ac["properties"])
+        for prop in sorted(all_props):
+            bv = bc["properties"].get(prop, "")
+            av = ac["properties"].get(prop, "")
+            if bv != av:
+                prop_changes.append({"property": prop, "before": bv, "after": av})
+        if prop_changes:
+            changed.append({
+                "name": name,
+                "quantity_before": bc["quantity"],
+                "quantity_after":  ac["quantity"],
+                "property_changes": prop_changes,
+            })
+
+    return {
+        "before_path": before_path,
+        "after_path":  after_path,
+        "components_added":   added,
+        "components_removed": removed,
+        "components_changed": changed,
+    }
+
+
+def _folder_assembly_diff(before_path: str, after_path: str) -> dict:
+    """
+    Approximate diff without SolidWorks — compare *.SLDPRT / *.SLDASM files
+    present in each assembly's directory.  Less accurate than COM (can't see
+    inside nested assemblies), but works on any OS for quick testing.
+    """
+    exts = {".SLDPRT", ".SLDASM"}
+
+    def _names(p: str) -> dict[str, int]:
+        d = Path(p).parent
+        return {f.name.upper(): 1 for f in d.iterdir() if f.suffix.upper() in exts}
+
+    before_comps = _names(before_path)
+    after_comps  = _names(after_path)
+    before_names = set(before_comps)
+    after_names  = set(after_comps)
+
+    return {
+        "before_path": before_path,
+        "after_path":  after_path,
+        "components_added":   [{"name": n, "quantity": 1} for n in sorted(after_names - before_names)],
+        "components_removed": [{"name": n, "quantity": 1} for n in sorted(before_names - after_names)],
+        "components_changed": [],
+        "_source": "folder_scan",  # flag so callers know this is approximate
+    }
+
+
 class AuthorViewRequest(BaseModel):
     view_id: str
     azimuth: float

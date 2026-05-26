@@ -48,6 +48,22 @@ class ComposerClient:
         resp.raise_for_status()
         return resp.json()
 
+    def diff(self, before_path: str, after_path: str) -> dict:
+        """
+        Compare two SolidWorks assemblies and return component-level differences.
+
+        Returns a dict with keys:
+          before_path, after_path,
+          components_added, components_removed, components_changed
+        """
+        resp = self._client.post(
+            "/diff",
+            json={"before_path": before_path, "after_path": after_path},
+            timeout=120.0,  # opening two assemblies can take a while
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def author_view(self, view_id: str, azimuth: float, elevation: float) -> dict:
         """Set camera angle for a view (azimuth, elevation in degrees)."""
         resp = self._client.post(

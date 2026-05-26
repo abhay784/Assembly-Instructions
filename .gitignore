@@ -4,3 +4,10 @@ output/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Large Prusa files
+prusa-i3-mk3-solidworks-1.snapshot.38/
+prusa-i3-mk3s-solidworks-with-step-1.snapshot.9/
+prusa-i3-mk3-solidworks-1.snapshot.38.zip
+prusa-i3-mk3s-solidworks-with-step-1.snapshot.9.zip
+original-prusa-i3-mk3s-kit-assembly_1128_en_2025-04-18.pdf
