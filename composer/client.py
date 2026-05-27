@@ -35,7 +35,15 @@ class ComposerClient:
 
     def list_views(self) -> list[dict]:
         resp = self._client.get("/views")
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Surface the bridge's HTTPException detail so callers see the
+            # actual COM/SW error (e.g. "no document open", "Views property
+            # missing on viewer-only ActiveX") instead of a bare 500.
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"Bridge /views failed (HTTP {resp.status_code}): {detail}")
         return resp.json()
 
     def render(self, view_id: str) -> str:

@@ -91,7 +91,58 @@ Cross-step references (IMPORTANT):
 8. Within the SAME section, you may reference earlier steps the same way using the step_id you will assign them.
 9. When a part appears in MANIFEST.parts_introduced, reuse the existing part_id verbatim to keep references consistent across sections.
 
-10. Output ONLY a JSON array — no markdown fences, no commentary."""
+10. Output ONLY a JSON array — no markdown fences, no commentary.
+
+WORKED EXAMPLE — what a correctly-parsed step looks like:
+
+Input fragment:
+  "Step 3 — Install Y-axis motor
+
+  Attention: align the motor shaft with the pulley before tightening.
+
+  Take the Y-motor (1x) and fasten it to the frame using two M3x10 screws.
+  Torque: 0.4 Nm. Make sure the cable points to the rear.
+  See step 1 [[see: 2a._y-axis_assembly_step_01]] for the cable routing.
+  [photo: motor_mounting.jpg]"
+
+Correct output object:
+{
+  "step_id": "2a._y-axis_assembly_step_03",
+  "section": "2A. Y-axis Assembly",
+  "step_number": 3,
+  "heading": "Install Y-axis motor",
+  "body_text": "Attention: align the motor shaft with the pulley before tightening. Take the Y-motor (1x) and fasten it to the frame using two M3x10 screws. Torque: 0.4 Nm. Make sure the cable points to the rear. See step 1 [[see: 2a._y-axis_assembly_step_01]] for the cable routing.",
+  "parts_referenced": [
+    {"part_id": "Y-motor", "qty": 1, "role": "drive motor for Y-axis", "source": "explicit"},
+    {"part_id": "M3x10 screw", "qty": 2, "role": "fastens motor to frame", "source": "explicit"}
+  ],
+  "specs": [
+    {"key": "torque_nm", "value": "0.4", "unit": "Nm", "source_span": "Torque: 0.4 Nm"}
+  ],
+  "callouts": [
+    {"type": "attention", "text": "align the motor shaft with the pulley before tightening"}
+  ],
+  "images": [
+    {"image_id": "2a._y-axis_assembly_step_03_img_1", "kind": "reference_photo", "caption": "motor_mounting.jpg", "camera_hint": null, "visible_parts": ["Y-motor", "frame"]}
+  ],
+  "tools_operations": ["torque wrench"]
+}
+
+COMMON MISTAKES — avoid these specifically:
+
+A. **Paraphrasing numeric values.** If the source says "0.4 Nm", output "0.4" in `value`, not "0.4 Nm" or "less than 0.5 Nm" or "approximately 0.4". The `unit` field is separate.
+
+B. **Missing source_span.** Every spec MUST include `source_span` containing the verbatim excerpt the value came from. Without it, downstream validators can't audit the extraction. If you can't find a source_span, the spec is likely hallucinated — drop it.
+
+C. **Guessing step_ids for cross-references.** If you see "see step 3" but MANIFEST.step_id_index doesn't contain a matching entry from the current or prior sections, leave the text alone. A wrong pointer is worse than no pointer.
+
+D. **Using null where empty arrays are required.** Rule 6: `parts_referenced: []`, NOT `parts_referenced: null`. Same for specs, callouts, images, tools_operations.
+
+E. **Confusing renderable_cad with reference_photo.** A 3D CAD render or technical line drawing → `renderable_cad`. A real-world photograph (visible focus blur, real lighting, real screwdriver in someone's hand) → `reference_photo`. When in doubt, prefer `reference_photo`.
+
+F. **Inventing parts.** If the prose talks about "the bracket" without ever naming it, look at MANIFEST.parts_introduced for a recent bracket. If none exists, mark `source: "inferred"` and use a descriptive label like "Upper Bracket" — do NOT invent a SKU/part number that wasn't in the source.
+
+G. **HTML tags inside body_text.** `body_text` is plain prose. NEVER emit `<br>`, `<br/>`, `<p>`, `<strong>`, `<em>`, or any other HTML tag. For paragraph breaks inside a step, use a JSON-escaped newline (`\\n`) — the downstream renderer converts those to `<br>` on its own. Emitting literal `<br>` produces broken output in the final PDF and the review queue."""
 
 
 def run(
@@ -184,6 +235,8 @@ def _load_or_parse_section(
         section_path = ckpt / f"section_{section_index:03d}_{slug}.json"
         if section_path.exists():
             data = json.loads(section_path.read_text(encoding="utf-8"))
+            for item in data:
+                _scrub_html_breaks(item)
             steps = [Step.model_validate(item) for item in data]
             print(f"  Stage 1: section {section_index + 1} ({section_name!r}) "
                   f"loaded from checkpoint ({len(steps)} steps)")
@@ -270,6 +323,7 @@ def _parse_section(
         messages=[{"role": "user", "content": user_message}],
         system=_PARSE_SECTION_PROMPT,
         max_tokens=_PER_SECTION_MAX_TOKENS,
+        cache_system=True,  # Pass 2 calls share the same system prompt across all sections
     )
     if response.truncated:
         # Distinguish "model ran out of output budget" from "model emitted bad JSON" —
@@ -282,7 +336,23 @@ def _parse_section(
             f"step boundaries."
         )
     parsed = _parse_json_response(response.content)
+    for item in parsed:
+        _scrub_html_breaks(item)
     return [Step.model_validate(item) for item in parsed]
+
+
+# Strips HTML line-break tags the LLM occasionally emits inside body_text
+# despite the prompt's prohibition. Catches `<br>`, `<br/>`, `<br />`
+# (case-insensitive, any whitespace). Converts each to a single `\n` so the
+# template's `replace('\n', '<br>')` filter renders the breaks correctly
+# instead of showing literal tag text in the final PDF and review queue.
+_BR_TAG_RE = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
+
+
+def _scrub_html_breaks(item: dict) -> None:
+    body = item.get("body_text")
+    if isinstance(body, str) and "<" in body:
+        item["body_text"] = _BR_TAG_RE.sub("\n", body)
 
 
 def _update_manifest(manifest: dict, section_name: str, steps: list[Step]) -> None:

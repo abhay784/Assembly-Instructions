@@ -27,6 +27,95 @@ _MAX_RETRIES = 4
 _BACKOFF_BASE_SEC = 2.0
 
 
+# ---------------------------------------------------------------------------
+# Usage telemetry
+# ---------------------------------------------------------------------------
+# Per-family token totals across every complete() call in this process. Each
+# call adds to its model family's bucket; get_cost_summary() converts to
+# dollars using current public pricing.
+
+_USAGE_TOTALS: dict[str, int] = {
+    "sonnet_input":           0,
+    "sonnet_cache_read":      0,
+    "sonnet_cache_creation":  0,
+    "sonnet_output":          0,
+    "haiku_input":            0,
+    "haiku_cache_read":       0,
+    "haiku_cache_creation":   0,
+    "haiku_output":           0,
+    "opus_input":             0,
+    "opus_cache_read":        0,
+    "opus_cache_creation":    0,
+    "opus_output":            0,
+}
+
+# Per-million-token rates in USD. Cache reads are billed at 10% of the input
+# rate; cache writes (creation) are billed at 1.25x the input rate.
+_PRICING_PER_M_TOKENS = {
+    "sonnet": {"input":  3.00, "output": 15.00},
+    "haiku":  {"input":  0.80, "output":  4.00},
+    "opus":   {"input": 15.00, "output": 75.00},
+}
+
+
+def _model_family(model: str) -> str:
+    m = model.lower()
+    if "haiku" in m:
+        return "haiku"
+    if "opus" in m:
+        return "opus"
+    return "sonnet"  # default: anything else (sonnet variants, custom fine-tuned)
+
+
+def _accumulate_usage(model: str, usage) -> None:
+    family = _model_family(model)
+    _USAGE_TOTALS[f"{family}_input"]          += getattr(usage, "input_tokens", 0) or 0
+    _USAGE_TOTALS[f"{family}_cache_read"]     += getattr(usage, "cache_read_input_tokens", 0) or 0
+    _USAGE_TOTALS[f"{family}_cache_creation"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+    _USAGE_TOTALS[f"{family}_output"]         += getattr(usage, "output_tokens", 0) or 0
+
+    if os.environ.get("LLM_DEBUG_USAGE") == "1":
+        print(
+            f"  [usage] {family} "
+            f"in={getattr(usage, 'input_tokens', 0)} "
+            f"cache_read={getattr(usage, 'cache_read_input_tokens', 0)} "
+            f"cache_create={getattr(usage, 'cache_creation_input_tokens', 0)} "
+            f"out={getattr(usage, 'output_tokens', 0)}"
+        )
+
+
+def get_cost_summary() -> dict:
+    """Return token totals + estimated cost across all complete() calls so far.
+
+    Cache reads are priced at 10% of the standard input rate; cache writes
+    (creation) at 1.25x (the 25% premium Anthropic charges for the initial
+    write to the cache). Output is always at the model's output rate.
+    """
+    totals = dict(_USAGE_TOTALS)
+    cost_by_family: dict[str, float] = {}
+    total_cost = 0.0
+
+    for family, rates in _PRICING_PER_M_TOKENS.items():
+        c  = totals[f"{family}_input"]          * rates["input"]         / 1_000_000
+        c += totals[f"{family}_cache_read"]     * rates["input"] * 0.10  / 1_000_000
+        c += totals[f"{family}_cache_creation"] * rates["input"] * 1.25  / 1_000_000
+        c += totals[f"{family}_output"]         * rates["output"]        / 1_000_000
+        cost_by_family[family] = round(c, 4)
+        total_cost += c
+
+    return {
+        "tokens":             totals,
+        "cost_by_family_usd": cost_by_family,
+        "estimated_cost_usd": round(total_cost, 4),
+    }
+
+
+def reset_cost_summary() -> None:
+    """Zero the running totals — useful when running multiple pipelines in one process."""
+    for k in _USAGE_TOTALS:
+        _USAGE_TOTALS[k] = 0
+
+
 class ClaudeClient:
     """Anthropic Claude API client — swap-in replacement for VLLMClient."""
 
@@ -43,11 +132,27 @@ class ClaudeClient:
         system: str,
         tools: list[dict] | None = None,
         max_tokens: int = 8096,
+        model: str | None = None,
+        cache_system: bool = False,
     ) -> LLMResponse:
+        # Wrap system as a block list with cache_control when caching is
+        # requested. Anthropic requires a list of typed blocks (not a string)
+        # to attach cache_control. The cached prefix must be >=1024 tokens
+        # (Sonnet/Opus) or >=2048 tokens (Haiku); below that, cache_control
+        # is ignored and the call is billed at full input rate.
+        if cache_system:
+            system_payload: list | str = [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        else:
+            system_payload = system
+
         kwargs: dict = {
-            "model": self._model,
+            "model": model or self._model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": system_payload,
             "messages": _to_anthropic_messages(messages),
         }
         if tools:
@@ -71,6 +176,13 @@ class ClaudeClient:
                                     "arguments": json.dumps(block.input),
                                 }
                             )
+
+                # Telemetry: accumulate token usage for end-of-run cost
+                # estimate. Guarded against missing usage attr to stay robust
+                # across SDK versions.
+                usage = getattr(final, "usage", None)
+                if usage is not None:
+                    _accumulate_usage(kwargs["model"], usage)
 
                 return LLMResponse(
                     content=content_text,

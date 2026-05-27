@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from pathlib import Path
 
-from llm import get_client
+from llm import get_client, get_cost_summary
 from stages import (
     agent_planner,
     change_mapper,
@@ -49,6 +49,7 @@ from stages import (
     image_renderer,
     instruction_parser,
     pdf_generator,
+    structural_eval,
     text_revision,
 )
 from finetune.angle_optimizer import optimize_angles_for_steps, print_angle_report
@@ -98,7 +99,12 @@ def main():
     if not has_change_source:
         parser.error("Provide --diff, --eco, or both --before-model and --after-model")
 
-    run_id = args.run_id or f"{args.document_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # Strip path separators from document_id before splicing it into run_id —
+    # a stray trailing `\` (PowerShell tab-completion artifact) embeds a
+    # directory split into every checkpoint path. Resume then can't find its
+    # own state without quoting the literal backslash on the CLI.
+    safe_doc_id = args.document_id.replace("\\", "").replace("/", "")
+    run_id = args.run_id or f"{safe_doc_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
     print(f"Run ID: {run_id}")
 
     llm = get_client()
@@ -201,10 +207,26 @@ def main():
         run_id=run_id,
     )
 
+    # Stage 9 — Structural Evaluation
+    # Deterministic, no LLM. Verifies each ECO change actually surfaced in
+    # the revised text and the new-step counts match the plan. Writes
+    # eval_report.json next to the PDF.
+    eval_report = structural_eval.run(
+        original_steps=steps,
+        evaluated_steps=evaluated,
+        action_plans=plans,
+        ecos=ecos,
+    )
+    eval_report_path = Path(run_output_dir) / "eval_report.json"
+    eval_report_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_report_path.write_text(json.dumps(eval_report, indent=2), encoding="utf-8")
+    print(f"\n{structural_eval.render_report(eval_report)}")
+
     print(f"\nOutputs written to {run_output_dir}/")
     print(f"  PDF:    {outputs['pdf']}")
     print(f"  Diff:   {outputs['diff_json']}")
     print(f"  Review: {outputs['review_json']}")
+    print(f"  Eval:   {eval_report_path}")
 
     review_count = len(json.loads(Path(outputs["review_json"]).read_text())["flagged_steps"])
     if review_count:
@@ -220,6 +242,25 @@ def main():
     print(f"\nLearning: {example_count} approved example(s) collected (need 100 to fine-tune)")
     if review_count == 0:
         print("  No flagged steps — run went clean, nothing to approve this cycle")
+
+    # Cost telemetry — sums all LLM tokens consumed across the run, by model
+    # family, and converts to a USD estimate using current public pricing.
+    # Only the Claude backend reports usage; vLLM is local so this is $0 there.
+    cost = get_cost_summary()
+    tokens = cost["tokens"]
+    if cost["estimated_cost_usd"] > 0:
+        print(f"\nLLM cost — estimated ${cost['estimated_cost_usd']:.2f} this run")
+        for family, family_cost in cost["cost_by_family_usd"].items():
+            if family_cost > 0:
+                fam_in    = tokens[f"{family}_input"]
+                fam_cr    = tokens[f"{family}_cache_read"]
+                fam_cw    = tokens[f"{family}_cache_creation"]
+                fam_out   = tokens[f"{family}_output"]
+                print(
+                    f"  {family:<7} ${family_cost:>6.2f}  "
+                    f"in={fam_in:>7}  cache_read={fam_cr:>7}  "
+                    f"cache_create={fam_cw:>7}  out={fam_out:>7}"
+                )
 
 
 def _publish(run_id: str, output_dir: str):

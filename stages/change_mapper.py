@@ -31,6 +31,7 @@ def run(
     raw_index = _build_raw_index(steps)
     affected: list[AffectedStep] = []
     seen: set[tuple[str, str]] = set()
+    dropped_near_matches: list[tuple[str, str, str]] = []  # (eco_part, step_part, reason)
 
     for eco in ecos:
         # Strategy 1: exact normalized match
@@ -41,8 +42,13 @@ def run(
         fuzzy_hits: set[str] = set()
         for step_id, raw_parts in raw_index.items():
             if step_id not in exact_hits:
-                if any(_parts_match(eco.part_number, rp) for rp in raw_parts):
-                    fuzzy_hits.add(step_id)
+                for rp in raw_parts:
+                    matched, reject_reason = _parts_match(eco.part_number, rp)
+                    if matched:
+                        fuzzy_hits.add(step_id)
+                        break
+                    if reject_reason is not None:
+                        dropped_near_matches.append((eco.part_number, rp, reject_reason))
 
         for step_id in exact_hits | fuzzy_hits:
             key = (step_id, eco.eco_id)
@@ -74,6 +80,18 @@ def run(
                             )
                         )
 
+    # Diagnostic: summarize fuzzy-match candidates that were rejected by the
+    # strict rule. If real matches are being dropped, this output helps the
+    # user adjust _DISTINCTIVE_STOPWORDS or the overlap threshold below.
+    if dropped_near_matches:
+        from collections import Counter
+        reason_counts = Counter(reason for _, _, reason in dropped_near_matches)
+        print(
+            f"  Change mapper: dropped {len(dropped_near_matches)} near-matches "
+            f"under strict rule "
+            f"({', '.join(f'{r}={n}' for r, n in reason_counts.most_common())})"
+        )
+
     return affected
 
 
@@ -101,24 +119,63 @@ def _tokenize(s: str) -> set[str]:
     return {t for t in tokens if len(t) >= 3 and not t.isdigit()}
 
 
-def _parts_match(eco_part: str, step_part: str) -> bool:
+# Tokens that are too generic to anchor a match on their own. Two-token
+# overlaps consisting entirely of these words match almost any pair of part
+# names (e.g. "Upper Bracket" matches "Upper Frame" via {upper}).
+_DISTINCTIVE_STOPWORDS = {
+    "part", "parts", "screw", "screws", "bolt", "bolts", "nut", "nuts",
+    "washer", "washers", "metal", "plastic", "left", "right", "front",
+    "back", "upper", "lower", "top", "bottom", "side", "inner", "outer",
+    "small", "large", "long", "short", "main", "kit", "set", "assembly",
+    "component", "components", "piece", "pieces",
+}
+
+
+def _parts_match(eco_part: str, step_part: str) -> tuple[bool, str | None]:
     """
     True if eco_part and step_part refer to the same physical part.
-    Uses two strategies:
-      1. Exact normalized match  (fast, handles identical names)
-      2. Token overlap           (handles prefix/suffix mismatches like
-                                  'OpenLeg_Upper_Bracket' vs 'Upper Bracket')
+
+    Returns (matched, reject_reason). reject_reason is None when matched is
+    True OR when the pair had no overlap at all (not worth logging). It is
+    a short string when the pair was a near-match dropped by the strict rule
+    — the caller surfaces this for diagnostics so the user can validate that
+    no legitimate matches are being lost.
+
+    Strategies:
+      1. Exact normalized match — handles identical names.
+      2. Token overlap with three guards (catches the 10x-amplification from
+         the previous "2 shared tokens" rule):
+         a) ≥2 shared tokens
+         b) overlap / max(|eco|, |step|) ≥ 0.5 — measure against the LARGER
+            set so that one common prefix word doesn't carry a tiny ECO name
+            to a large step name.
+         c) At least one shared token is distinctive (≥4 chars and not in
+            _DISTINCTIVE_STOPWORDS) — prevents matches built entirely on
+            generic words like "upper/lower/screw".
     """
     if _normalize(eco_part) == _normalize(step_part):
-        return True
+        return True, None
+
     eco_tokens = _tokenize(eco_part)
     step_tokens = _tokenize(step_part)
     if not eco_tokens or not step_tokens:
-        return False
+        return False, None
+
     overlap = eco_tokens & step_tokens
-    # Require at least 2 shared tokens OR the smaller set is fully covered
-    smaller = min(len(eco_tokens), len(step_tokens))
-    return len(overlap) >= 2 or (smaller > 0 and len(overlap) / smaller >= 0.6)
+    if not overlap:
+        return False, None
+
+    if len(overlap) < 2:
+        return False, "too_few_shared_tokens"
+
+    coverage = len(overlap) / max(len(eco_tokens), len(step_tokens))
+    if coverage < 0.5:
+        return False, "low_coverage"
+
+    if not any(len(t) >= 4 and t not in _DISTINCTIVE_STOPWORDS for t in overlap):
+        return False, "only_generic_tokens"
+
+    return True, None
 
 
 def _build_index(steps: list[Step]) -> dict[str, list[str]]:

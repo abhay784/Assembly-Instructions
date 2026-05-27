@@ -31,6 +31,8 @@ class LLMClient(Protocol):
         system: str,
         tools: list[dict] | None = None,
         max_tokens: int = 8096,
+        model: str | None = None,
+        cache_system: bool = False,
     ) -> LLMResponse: ...
 
     def stream(

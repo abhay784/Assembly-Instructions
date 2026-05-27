@@ -14,6 +14,7 @@ Tools available:
 """
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -26,15 +27,34 @@ from schemas.pipeline_state import ActionPlan, RevisedStep
 from tools import mate_constraints as mate_tool
 from tools import part_history as history_tool
 
-_MAX_LOOP_ITERATIONS = 10
+
+def _tools_configured() -> bool:
+    """True if either tool's backing data source is wired up.
+
+    Without PART_HISTORY_DB or MATE_GRAPH_DB set (and the Composer /mates
+    endpoint is a stub returning ``[]`` in the current bridge), the tools
+    return empty data on every call. The agent burns iterations probing
+    them for nothing. Skipping the tools entirely in that state recovers
+    those iterations cleanly.
+    """
+    return bool(
+        os.environ.get("PART_HISTORY_DB")
+        or os.environ.get("MATE_GRAPH_DB")
+    )
+
+# Most successful revisions converge in 1-3 turns; values past 5 are the
+# stuck-agent tail (model re-emitting bad JSON, looping tool calls on empty
+# stubs). Capping at 5 limits worst-case per-step cost without hurting
+# convergence on normal cases.
+_MAX_LOOP_ITERATIONS = 5
 
 _SYSTEM_PROMPT = """You are a mechanical assembly instruction writer. Your job is to revise an assembly step based on an engineering change order (ECO).
 
 CRITICAL RULES — violations make the output invalid:
 1. Every numeric value (dimensions, torques, counts, distances) in your revised text MUST appear verbatim in either the ECO changes or the original step text. Never invent or estimate values.
 2. Every part number in your revised text MUST appear verbatim in either the ECO or the original step. Never invent part numbers.
-3. If you are uncertain about how a new part connects to the assembly, use the query_mate_constraints tool before writing.
-4. If you need the history of a part to understand the change context, use lookup_part_history.
+3. If you are uncertain about how a new part connects to the assembly, use the query_mate_constraints tool before writing. Important: if the tool returns an empty list or a "not configured" note, do NOT call it again — proceed without that information and flag the step instead.
+4. If you need the history of a part to understand the change context, use lookup_part_history. Same rule applies: don't re-call after an empty/not-configured response.
 
 STYLE RULES — apply these when revising an existing step:
 5. Match the exact terminology of the original (e.g. if the original says "fastener", never substitute "screw" or "bolt").
@@ -57,7 +77,44 @@ Confidence levels:
 
 Common flags: "assembly_logic_uncertain", "torque_spec_unverified", "part_number_inferred", "sequence_position_uncertain"
 
-Output ONLY the JSON object when done — no markdown, no extra text."""
+Output ONLY the JSON object when done — no markdown, no extra text.
+
+WORKED EXAMPLES — one per change type, showing a good revision against a bad one:
+
+Example A — dimension change (torque value):
+  Original: "Fasten the Y-motor to the frame with two M3x10 screws. Torque to 0.4 Nm."
+  ECO change: field="torque_nm", old="0.4", new="0.6"
+  Good revision: "Fasten the Y-motor to the frame with two M3x10 screws. Torque to 0.6 Nm."
+    {"revised_body_text": "...", "confidence": "high", "flags": [], "reasoning": "Value sourced directly from ECO; prose otherwise unchanged."}
+  Bad revision (DO NOT DO THIS):
+    "Fasten the Y-motor to the frame with two M3x10 fasteners. Apply approximately 0.6 Nm of torque." — substituted "fasteners" for "screws" (violates rule 5) and added "approximately" (loosens the spec).
+
+Example B — mate constraint change:
+  Original: "Press the bearing onto the shaft until concentric with the housing bore."
+  ECO change: field="mate_type", old="concentric", new="coincident"
+  Good revision: "Press the bearing onto the shaft until coincident with the housing bore."
+    {"revised_body_text": "...", "confidence": "high", "flags": [], "reasoning": "Direct mate-type substitution from ECO."}
+  Bad revision: "Press the bearing into place — see updated diagram." — drops a specific term (rule 8) and adds a non-existent reference.
+
+Example C — part swap:
+  Original: "Install the LM8UU linear bearing into the carriage."
+  ECO change: field="part", old="LM8UU", new="IGUS RJ4JP-01-08"
+  Good revision: "Install the IGUS RJ4JP-01-08 linear bearing into the carriage."
+    {"revised_body_text": "...", "confidence": "high", "flags": [], "reasoning": "Pure rename — part role unchanged."}
+  Bad revision: "Install the new linear bearing (specs unchanged) into the carriage." — vague; the engineer needs the actual part number.
+
+Example D — new part added (no original step):
+  ECO change: adds "thermistor cable shield"
+  Good revision: "Slide the thermistor cable shield over the wire bundle exiting the hotend, securing it with the included clip."
+    {"revised_body_text": "...", "confidence": "low", "flags": ["assembly_logic_uncertain", "sequence_position_uncertain"], "reasoning": "New step authored without prior context; engineer should verify assembly order."}
+  Notice: confidence is "low" and the flags surface what's uncertain.
+
+ANTI-PATTERNS — never do these:
+
+X. Invent a numeric value not in the ECO or original step (rule 1).
+X. Substitute synonyms for technical terms (rule 5: "screw" stays "screw"; "fastener" stays "fastener").
+X. Call lookup_part_history or query_mate_constraints more than once with the same argument — if the first call returned empty, the second will too.
+X. Output anything other than the final JSON when done — no preamble, no markdown fence, no postscript."""
 
 
 _TOOLS = [history_tool.schema(), mate_tool.schema()]
@@ -90,6 +147,13 @@ def run(
     eco_map = {eco.eco_id: eco for eco in ecos}
     step_map = {s.step_id: s for s in steps}
 
+    tools_enabled = _tools_configured()
+    if not tools_enabled:
+        print(
+            "  Stage 4: PART_HISTORY_DB / MATE_GRAPH_DB not configured — "
+            "running without tools (avoids wasted iterations on empty stubs)"
+        )
+
     revised: list[RevisedStep] = []
     for plan_idx, plan in enumerate(action_plans):
         if plan.action == "no_change":
@@ -109,7 +173,7 @@ def run(
 
         eco = eco_map[plan.eco_id]
         original_step = step_map.get(plan.step_id)
-        result = _load_or_revise(plan, plan_idx, eco, original_step, llm, ckpt)
+        result = _load_or_revise(plan, plan_idx, eco, original_step, llm, ckpt, tools_enabled)
         revised.append(result)
 
     return revised
@@ -128,12 +192,21 @@ def _load_or_revise(
     original_step: Step | None,
     llm: LLMClient,
     ckpt: Path | None,
+    tools_enabled: bool,
 ) -> RevisedStep:
     if ckpt is not None:
         path = ckpt / f"plan_{plan_idx:04d}_{_plan_slug(plan)}.json"
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                # Scrub legacy `<br>` artifacts on load — these were written
+                # before the Stage 1/4 sanitizer existed. Avoids re-running
+                # the whole revision just to clean up tag text.
+                if isinstance(data.get("revised_body_text"), str):
+                    data["revised_body_text"] = _BR_TAG_RE.sub("\n", data["revised_body_text"])
+                orig = data.get("original_step")
+                if isinstance(orig, dict) and isinstance(orig.get("body_text"), str):
+                    orig["body_text"] = _BR_TAG_RE.sub("\n", orig["body_text"])
                 cached = RevisedStep.model_validate(data)
                 print(f"  Stage 4: plan {plan_idx + 1} ({plan.step_id}) loaded from checkpoint")
                 return cached
@@ -144,7 +217,7 @@ def _load_or_revise(
                 print(f"  Stage 4: plan {plan_idx + 1} cache rejected ({type(e).__name__}), re-running")
                 path.unlink(missing_ok=True)
 
-    result = _run_revision_loop(plan, eco, original_step, llm)
+    result = _run_revision_loop(plan, eco, original_step, llm, tools_enabled)
 
     if ckpt is not None:
         path = ckpt / f"plan_{plan_idx:04d}_{_plan_slug(plan)}.json"
@@ -161,20 +234,25 @@ def _run_revision_loop(
     eco: ECO,
     original_step: Step | None,
     llm: LLMClient,
+    tools_enabled: bool = True,
 ) -> RevisedStep:
     is_new = plan.action == "add_step_flagged"
 
     user_content = _build_initial_message(plan, eco, original_step, is_new)
     messages = [{"role": "user", "content": user_content}]
+    tools_for_call = _TOOLS if tools_enabled else None
 
     for _ in range(_MAX_LOOP_ITERATIONS):
         # 8K is enough for one revised step (body text + flags + reasoning).
         # Set explicitly so future default changes don't silently degrade.
+        # cache_system=True: the same system prompt runs for every step and
+        # every loop iteration — hundreds of calls share one cached prefix.
         response = llm.complete(
             messages=messages,
             system=_SYSTEM_PROMPT,
-            tools=_TOOLS,
+            tools=tools_for_call,
             max_tokens=8192,
+            cache_system=True,
         )
 
         if response.has_tool_calls:
@@ -313,7 +391,16 @@ def _parse_revision_output(content: str) -> dict | None:
     body = result.get("revised_body_text")
     if not isinstance(body, str) or not body.strip():
         return None
+    # The revision LLM is told to preserve the original's formatting (rule 8),
+    # so if Stage 1 ever leaked a `<br>` into the original_step (older
+    # checkpoints, models pre-G-rule), the revision will faithfully echo it.
+    # Scrub here as a final guard so revised_body_text in review_required.json
+    # and the rendered PDF never contains literal HTML tag text.
+    result["revised_body_text"] = _BR_TAG_RE.sub("\n", body)
     return result
+
+
+_BR_TAG_RE = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
 
 
 def _make_placeholder_step(step_id: str) -> Step:

@@ -55,14 +55,21 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Backend 1: Composer bridge ---
+    # Health passing only means the HTTP server is up; the underlying COM
+    # connection can still be a viewer-only ActiveX (no Views automation)
+    # or have no .smg loaded. Catch any per-call failure inside the bridge
+    # path so the SolidWorks COM fallback below still gets a chance to run.
     with ComposerClient() as composer:
         if composer.health():
-            return _render_via_composer(
-                composer, render_plans, action_plans, revised_steps,
-                smg_path, new_cad_path, output_dir, assets_dir, document_id,
-            )
-
-    print("  Stage 5: Composer bridge not reachable — trying SolidWorks direct")
+            try:
+                return _render_via_composer(
+                    composer, render_plans, action_plans, revised_steps,
+                    smg_path, new_cad_path, output_dir, assets_dir, document_id,
+                )
+            except Exception as e:
+                print(f"  Stage 5: Composer bridge failed mid-call ({e}) — falling back to SolidWorks direct")
+        else:
+            print("  Stage 5: Composer bridge not reachable — trying SolidWorks direct")
 
     # --- Backend 2: SolidWorks COM ---
     if new_cad_path and new_cad_path.lower().endswith((".sldasm", ".sldprt")):

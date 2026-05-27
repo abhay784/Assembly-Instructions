@@ -1,7 +1,7 @@
 import os
 
 from llm.client import LLMClient, LLMResponse
-from llm.claude_client import ClaudeClient
+from llm.claude_client import ClaudeClient, get_cost_summary, reset_cost_summary
 from llm.vllm_client import VLLMClient
 
 
@@ -12,4 +12,12 @@ def get_client() -> LLMClient:
     return VLLMClient()
 
 
-__all__ = ["LLMClient", "LLMResponse", "VLLMClient", "ClaudeClient", "get_client"]
+__all__ = [
+    "LLMClient",
+    "LLMResponse",
+    "VLLMClient",
+    "ClaudeClient",
+    "get_client",
+    "get_cost_summary",
+    "reset_cost_summary",
+]

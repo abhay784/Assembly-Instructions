@@ -41,7 +41,32 @@ Rules:
 2. Dimension changes only require rerender if the change would visibly affect the CAD view at the assembly level (e.g. a 50mm→200mm shaft change is visible; a 0.1mm tolerance change is not).
 3. If impact is "indirect", lean toward "no_change" unless the ECO summary indicates assembly-level consequences.
 4. needs_manual_view=true is ONLY for "add_step_flagged" (no existing Composer view exists to re-render). For "rewrite_text_and_rerender", always set needs_manual_view=false — the existing view will be updated automatically.
-5. Output ONLY valid JSON. No markdown, no explanation."""
+5. Output ONLY valid JSON. No markdown, no explanation.
+
+WORKED EXAMPLES — one per action so the boundary is clear:
+
+Example 1 — rewrite_text (text-only change):
+  Input: step says "Torque the M3 screw to 0.4 Nm"; ECO changes "torque_nm" from 0.4 → 0.6.
+  Correct: {"action": "rewrite_text", "needs_manual_view": false, "rationale": "Torque value change is prose-only; no visual difference in the assembly view."}
+
+Example 2 — rewrite_text_and_rerender (visible geometry change):
+  Input: step shows the upper bracket; ECO changes the bracket's mounting holes from 4 holes to 2 holes.
+  Correct: {"action": "rewrite_text_and_rerender", "needs_manual_view": false, "rationale": "Hole pattern change is visible in any view containing the bracket — re-render the existing view."}
+
+Example 3 — add_step_flagged (brand-new part with no existing step):
+  Input: ECO adds a "thermistor cable shield" which has no current step.
+  Correct: {"action": "add_step_flagged", "needs_manual_view": true, "rationale": "New part not in any existing step; engineer must author the view because no Composer view_id exists."}
+
+Example 4 — no_change (indirect impact, no visible/textual consequence):
+  Input: step assembles the Y-axis frame; ECO changes the color of an unrelated logo plate that's only mentioned in the BoM, not in this step.
+  Correct: {"action": "no_change", "needs_manual_view": false, "rationale": "Indirect impact only; this step does not reference the changed part."}
+
+EDGE CASES — disambiguate these specifically:
+
+- Cosmetic-only changes (paint color, decal text) where the part is visible in the step → "rewrite_text_and_rerender" if the change appears in the existing view, otherwise "rewrite_text".
+- Tolerance tightening with no nominal change (e.g. ±0.2mm → ±0.05mm) → "no_change". Tolerances are not in prose at the assembly-instruction level.
+- ECO renames a part without altering geometry → "rewrite_text" so the prose uses the new name. Never "rewrite_text_and_rerender" for a pure rename.
+- ECO adds a part AND modifies an existing step (e.g. new screw used in an old step) → emit TWO plans: "rewrite_text" for the existing step + "add_step_flagged" for any net-new step required."""
 
 
 # Output scales linearly with the affected_steps count, so a single call
@@ -116,6 +141,7 @@ def _plan_batch(
         messages=[{"role": "user", "content": user_message}],
         system=_SYSTEM_PROMPT,
         max_tokens=_PER_BATCH_MAX_TOKENS,
+        cache_system=True,  # Same system prompt across all 10+ batches
     )
 
     if response.truncated:

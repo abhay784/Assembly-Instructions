@@ -22,9 +22,15 @@ class VLLMClient:
         system: str,
         tools: list[dict] | None = None,
         max_tokens: int = 8096,
+        model: str | None = None,
+        cache_system: bool = False,  # vLLM has no prompt-caching equivalent — accepted for API parity
     ) -> LLMResponse:
         full_messages = [{"role": "system", "content": system}, *messages]
-        kwargs: dict = {"model": self._model, "messages": full_messages, "max_tokens": max_tokens}
+        kwargs: dict = {
+            "model": model or self._model,
+            "messages": full_messages,
+            "max_tokens": max_tokens,
+        }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"

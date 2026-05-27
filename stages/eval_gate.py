@@ -24,6 +24,12 @@ import os
 import re
 
 from llm.client import LLMClient
+
+
+# Judges produce a tiny structured JSON (passes + 1-3 issue strings). Haiku is
+# more than capable here and roughly 4x cheaper than Sonnet, which matters
+# because the logic judge runs on every low/medium-confidence step.
+_JUDGE_MODEL = "claude-haiku-4-5-20251001"
 from schemas.eco import ECO
 from schemas.instruction import Step
 from schemas.pipeline_state import (
@@ -198,10 +204,12 @@ def _check_assembly_logic(
 
     # Judge output is small (passes + 1-3 issue strings). 4K is generous;
     # bumped from the 8K default only to leave room for verbose reasoning.
+    # Routed to Haiku — see _JUDGE_MODEL.
     response = llm.complete(
         messages=[{"role": "user", "content": user_content}],
         system=_LOGIC_JUDGE_SYSTEM,
         max_tokens=4096,
+        model=_JUDGE_MODEL,
     )
 
     if response.truncated:
@@ -264,6 +272,7 @@ def _check_image_quality(
         messages=[user_message],
         system=_IMAGE_JUDGE_SYSTEM,
         max_tokens=4096,
+        model=_JUDGE_MODEL,
     )
 
     if response.truncated:
