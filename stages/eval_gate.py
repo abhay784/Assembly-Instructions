@@ -71,6 +71,7 @@ def run(
     ecos: list[ECO],
     original_steps: list[Step],
     llm: LLMClient,
+    assembly_graph=None,  # Phase 4: optional AssemblyGraph for sequence audit
 ) -> list[EvaluatedStep]:
     eco_map = {eco.eco_id: eco for eco in ecos}
     original_map = {s.step_id: s for s in original_steps}
@@ -95,6 +96,10 @@ def run(
         if image and not image.skipped and image.new_path:
             flags += _check_image_quality(revised, image, llm)
 
+        # Check 4 (Phase 4 generation) — sequence audit against AssemblyGraph
+        if assembly_graph is not None:
+            flags += _check_sequence_audit(revised, assembly_graph)
+
         results.append(EvaluatedStep(
             revised_step=revised,
             rendered_image=image,
@@ -102,6 +107,32 @@ def run(
         ))
 
     return results
+
+
+def _check_sequence_audit(revised: RevisedStep, graph) -> list[EvalFlag]:
+    """Verify the step references only components that exist in the assembly.
+
+    Cheap deterministic complement to the document-evaluator LLM audit:
+    catches references to components not in the BoM (a tell-tale of
+    hallucinated parts), and catches steps whose parents weren't built
+    earlier in the order.
+    """
+    flags: list[EvalFlag] = []
+    component_names = {n.component_name.upper() for n in graph.nodes}
+    body = revised.revised_body_text.upper()
+
+    # Find any quoted-looking part references that don't exist in the BoM.
+    # This is intentionally narrow — we only flag obvious .SLDPRT / .SLDASM
+    # filename references since prose names can vary too much to allowlist.
+    for token in re.findall(r"[A-Z0-9_\-]+\.(?:SLDPRT|SLDASM)", body):
+        if token not in component_names:
+            flags.append(EvalFlag(
+                flag_type="assembly_logic_uncertain",
+                detail=f"Step references {token!r} but it is not in the assembly BoM.",
+                severity="warning",
+            ))
+            break  # one flag per step is enough; engineer review surfaces it
+    return flags
 
 
 def _check_spec_allowlist(

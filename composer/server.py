@@ -333,6 +333,162 @@ class DiffRequest(BaseModel):
     after_path: str
 
 
+class ExtractRequest(BaseModel):
+    assembly_path: str
+
+
+@app.post("/extract_assembly")
+def extract_assembly(req: ExtractRequest):
+    """
+    Walk one SolidWorks assembly and return its full BoM + mate graph.
+
+    Used by the Phase 4 generation pipeline (stages/cad_extract.py) as the
+    single source of truth about the design that's being documented.
+
+    Response shape (matches schemas.cad.BoM):
+      {
+        "assembly_path": str,
+        "components": [
+          {"name": str, "quantity": int, "mass_kg": float | null,
+           "properties": dict[str, str], "dimensions": dict[str, float]}
+        ],
+        "mates": [{"name": str, "type": str, "parts": [str, str]}]
+      }
+    """
+    if not _use_sw_for_diff():
+        raise HTTPException(503, "SolidWorks COM unavailable — /extract_assembly requires SldWorks")
+    try:
+        return _com_extract_assembly(req.assembly_path)
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+def _com_extract_assembly(assembly_path: str) -> dict:
+    import pythoncom  # type: ignore
+    pythoncom.CoInitialize()
+
+    sw = _sw_app
+    if sw is None:
+        raise RuntimeError("SldWorks COM application not initialized")
+
+    # swDocASSEMBLY = 2
+    doc = _open_doc6(sw, assembly_path, 2)
+    try:
+        comp_map = _get_assembly_components(doc)
+        mates = _get_assembly_mates_with_parts(doc)
+
+        # Attach per-component dimensions. The cheap path: walk each unique
+        # part file once and call _get_part_dimensions on its open doc.
+        # Failures are non-fatal — dimensions are nice-to-have.
+        components_out: list[dict] = []
+        for name, data in comp_map.items():
+            dims: dict[str, float] = {}
+            part_path = data.get("actual_path") or ""
+            if part_path and part_path.lower().endswith((".sldprt", ".prt")):
+                try:
+                    # swDocPART = 1
+                    part_doc = _open_doc6(sw, part_path, 1)
+                    dims = _get_part_dimensions(part_doc)
+                    try:
+                        sw.CloseDoc(Path(part_path).name)
+                    except Exception:
+                        pass
+                except Exception:
+                    dims = {}
+            components_out.append({
+                "name": name,
+                "quantity": data.get("quantity", 1),
+                "mass_kg": data.get("mass_kg"),
+                "properties": data.get("properties", {}),
+                "dimensions": dims,
+            })
+
+        return {
+            "assembly_path": assembly_path,
+            "components": components_out,
+            "mates": mates,
+        }
+    finally:
+        try:
+            sw.CloseDoc(Path(assembly_path).name)
+        except Exception:
+            pass
+
+
+def _get_assembly_mates_with_parts(doc) -> list[dict]:
+    """
+    Like _get_assembly_mates, but also records which two components each
+    mate joins. Falls back to an empty parts list when entity walking fails;
+    callers must tolerate that — the sequencer treats parts-less mates as
+    metadata-only and won't use them for graph edges.
+    """
+    mates: list[dict] = []
+    try:
+        feat = doc.FirstFeature()
+        while feat:
+            try:
+                if feat.GetTypeName2() in ("MateGroup", "MateGroup1"):
+                    sub = feat.GetFirstSubFeature()
+                    while sub:
+                        try:
+                            sf = sub.GetSpecificFeature2()
+                            if sf is not None:
+                                try:
+                                    mate_type = _MATE_TYPE_NAMES.get(
+                                        int(sf.Type), sub.GetTypeName2()
+                                    )
+                                except Exception:
+                                    mate_type = sub.GetTypeName2()
+                                parts = _read_mate_parts(sf)
+                                mates.append({
+                                    "name": sub.Name,
+                                    "type": mate_type,
+                                    "parts": parts,
+                                })
+                        except Exception:
+                            pass
+                        try:
+                            sub = sub.GetNextSubFeature()
+                        except Exception:
+                            break
+            except Exception:
+                pass
+            try:
+                feat = feat.GetNextFeature()
+            except Exception:
+                break
+    except Exception:
+        pass
+    return mates
+
+
+def _read_mate_parts(mate) -> list[str]:
+    """Pull the two component names off a Mate2 specific-feature object."""
+    parts: list[str] = []
+    try:
+        count = mate.GetMateEntityCount()
+    except Exception:
+        return parts
+    for i in range(min(count, 4)):
+        try:
+            ent = mate.MateEntity(i)
+            comp = ent.ReferenceComponent
+            path = _sw_get_path_name(comp)
+            if path:
+                parts.append(Path(path).name.upper())
+        except Exception:
+            continue
+    # Deduplicate but preserve order; a mate occasionally lists the same
+    # component twice when both entities are on one part.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique[:2]
+
+
 @app.post("/diff")
 def assembly_diff(req: DiffRequest):
     """

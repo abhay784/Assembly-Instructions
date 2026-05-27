@@ -82,6 +82,25 @@ class ComposerClient:
             raise RuntimeError(f"Bridge /diff failed (HTTP {resp.status_code}): {detail}")
         return resp.json()
 
+    def extract_assembly(self, assembly_path: str) -> dict:
+        """
+        Walk one SolidWorks assembly and return its full BoM + mate graph.
+        Used by the Phase 4 generation pipeline.
+        """
+        abs_path = str(Path(assembly_path).resolve())
+        resp = self._client.post(
+            "/extract_assembly",
+            json={"assembly_path": abs_path},
+            timeout=300.0,
+        )
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"Bridge /extract_assembly failed (HTTP {resp.status_code}): {detail}")
+        return resp.json()
+
     def author_view(self, view_id: str, azimuth: float, elevation: float) -> dict:
         """Set camera angle for a view (azimuth, elevation in degrees)."""
         resp = self._client.post(
