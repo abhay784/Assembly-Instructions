@@ -14,6 +14,7 @@ Endpoints:
 """
 
 import os
+from pathlib import Path
 
 import httpx
 
@@ -50,18 +51,35 @@ class ComposerClient:
 
     def diff(self, before_path: str, after_path: str) -> dict:
         """
-        Compare two SolidWorks assemblies and return component-level differences.
+        Compare two SolidWorks assemblies and return full component-level
+        and geometric differences.
 
         Returns a dict with keys:
-          before_path, after_path,
-          components_added, components_removed, components_changed
+          _source, before_path, after_path,
+          components_added, components_removed, components_changed,
+          mates_added, mates_removed
         """
+        # SolidWorks COM runs in its own process with its own CWD and cannot
+        # resolve paths relative to the bridge's working directory. Always
+        # send absolute, OS-native paths.
+        before_abs = str(Path(before_path).resolve())
+        after_abs  = str(Path(after_path).resolve())
+
         resp = self._client.post(
             "/diff",
-            json={"before_path": before_path, "after_path": after_path},
-            timeout=120.0,  # opening two assemblies can take a while
+            json={"before_path": before_abs, "after_path": after_abs},
+            # 300 s: opening two assemblies + resolving all lightweight
+            # components + reading mass properties across ~60 parts each
+            timeout=300.0,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Surface the bridge's HTTPException detail so callers see the
+            # actual COM/SW error instead of a bare "500 Internal Server Error".
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"Bridge /diff failed (HTTP {resp.status_code}): {detail}")
         return resp.json()
 
     def author_view(self, view_id: str, azimuth: float, elevation: float) -> dict:

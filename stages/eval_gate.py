@@ -165,10 +165,22 @@ def _check_assembly_logic(
         "agent_flags": revised.flags,
     })
 
+    # Judge output is small (passes + 1-3 issue strings). 4K is generous;
+    # bumped from the 8K default only to leave room for verbose reasoning.
     response = llm.complete(
         messages=[{"role": "user", "content": user_content}],
         system=_LOGIC_JUDGE_SYSTEM,
+        max_tokens=4096,
     )
+
+    if response.truncated:
+        # Eval gate annotates rather than blocks — surface the incomplete
+        # judgment as a flag instead of crashing the run.
+        return [EvalFlag(
+            flag_type="assembly_logic_uncertain",
+            detail=f"Logic judge response truncated at {len(response.content)} chars — review manually",
+            severity="warning",
+        )]
 
     result = _parse_judge_response(response.content)
     if result and not result.get("passes", True):
@@ -220,7 +232,15 @@ def _check_image_quality(
     response = llm.complete(
         messages=[user_message],
         system=_IMAGE_JUDGE_SYSTEM,
+        max_tokens=4096,
     )
+
+    if response.truncated:
+        return [EvalFlag(
+            flag_type="image_quality",
+            detail=f"Image judge response truncated at {len(response.content)} chars — review manually",
+            severity="info",
+        )]
 
     result = _parse_judge_response(response.content)
     if result and not result.get("passes", True):

@@ -115,7 +115,12 @@ def main():
 
     # Stage 1 — Instruction Parser
     raw_text = _load_instructions(args.instructions)
-    steps = _run_stage(run_id, "1_instruction_parser", lambda: instruction_parser.run(raw_text, llm))
+    parser_checkpoint_dir = Path(_STATE_DIR) / run_id / "1_instruction_parser_sections"
+    steps = _run_stage(
+        run_id,
+        "1_instruction_parser",
+        lambda: instruction_parser.run(raw_text, llm, checkpoint_dir=parser_checkpoint_dir),
+    )
     print(f"  Stage 1: {len(steps)} steps parsed")
 
     # Stage 2 — Change Mapper
@@ -143,7 +148,12 @@ def main():
         print(f"  Stage 3.5: Angle optimization failed ({e}), continuing with manual views")
 
     # Stage 4 — Text Revision
-    revised = _run_stage(run_id, "4_text_revision", lambda: text_revision.run(plans, steps, ecos, llm))
+    revision_checkpoint_dir = Path(_STATE_DIR) / run_id / "4_text_revision_plans"
+    revised = _run_stage(
+        run_id,
+        "4_text_revision",
+        lambda: text_revision.run(plans, steps, ecos, llm, checkpoint_dir=revision_checkpoint_dir),
+    )
     print(f"  Stage 4: {len(revised)} step(s) revised")
 
     # Stage 5 — Image Renderer

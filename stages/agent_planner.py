@@ -44,6 +44,16 @@ Rules:
 5. Output ONLY valid JSON. No markdown, no explanation."""
 
 
+# Output scales linearly with the affected_steps count, so a single call
+# eventually overflows even a 16K-token cap on large diffs (the Prusa
+# MK3→MK3S diff produces 300+ affected steps). Batching keeps each call
+# under cap and the per-batch output ~2-3K tokens. 30 is conservative
+# enough that even verbose rationales fit; raise it if you want fewer
+# round-trips and trust each output to stay tight.
+_BATCH_SIZE = 30
+_PER_BATCH_MAX_TOKENS = 16000
+
+
 def run(
     affected_steps: list[AffectedStep],
     ecos: list[ECO],
@@ -56,38 +66,76 @@ def run(
     eco_map = {eco.eco_id: eco for eco in ecos}
     step_map = {s.step_id: s for s in steps}
 
-    context_items = []
-    for aff in affected_steps:
-        eco = eco_map.get(aff.eco_id)
-        step = step_map.get(aff.step_id)
-        context_items.append({
-            "step_id": aff.step_id,
-            "eco_id": aff.eco_id,
-            "impact": aff.impact,
-            "change_types": aff.change_types,
-            "eco_summary": eco.summary if eco else "",
-            "eco_changes": [c.model_dump() for c in eco.changes] if eco else [],
-            "step_heading": step.heading if step else "",
-            "step_body_preview": (step.body_text[:300] if step else ""),
-            "step_images": [
-                {"kind": img.kind, "visible_parts": img.visible_parts}
-                for img in (step.images if step else [])
-            ],
-        })
+    context_items = [_build_context_item(aff, eco_map, step_map) for aff in affected_steps]
 
+    plans: list[ActionPlan] = []
+    total_batches = (len(context_items) + _BATCH_SIZE - 1) // _BATCH_SIZE
+
+    for batch_idx in range(0, len(context_items), _BATCH_SIZE):
+        batch = context_items[batch_idx : batch_idx + _BATCH_SIZE]
+        batch_num = batch_idx // _BATCH_SIZE + 1
+        print(f"  Stage 3: planning batch {batch_num}/{total_batches} ({len(batch)} step(s))")
+
+        batch_plans = _plan_batch(batch, llm, batch_num=batch_num, total_batches=total_batches)
+        plans.extend(batch_plans)
+
+    return plans
+
+
+def _build_context_item(
+    aff: AffectedStep,
+    eco_map: dict,
+    step_map: dict,
+) -> dict:
+    eco = eco_map.get(aff.eco_id)
+    step = step_map.get(aff.step_id)
+    return {
+        "step_id": aff.step_id,
+        "eco_id": aff.eco_id,
+        "impact": aff.impact,
+        "change_types": aff.change_types,
+        "eco_summary": eco.summary if eco else "",
+        "eco_changes": [c.model_dump() for c in eco.changes] if eco else [],
+        "step_heading": step.heading if step else "",
+        "step_body_preview": (step.body_text[:300] if step else ""),
+        "step_images": [
+            {"kind": img.kind, "visible_parts": img.visible_parts}
+            for img in (step.images if step else [])
+        ],
+    }
+
+
+def _plan_batch(
+    context_items: list[dict],
+    llm: LLMClient,
+    batch_num: int,
+    total_batches: int,
+) -> list[ActionPlan]:
     user_message = json.dumps(context_items, indent=2)
     response = llm.complete(
         messages=[{"role": "user", "content": user_message}],
         system=_SYSTEM_PROMPT,
+        max_tokens=_PER_BATCH_MAX_TOKENS,
     )
 
-    raw = _strip_fences(response.content)
-    parsed = json.loads(raw)
+    if response.truncated:
+        raise RuntimeError(
+            f"Agent planner batch {batch_num}/{total_batches} hit the output token "
+            f"limit ({_PER_BATCH_MAX_TOKENS}) on {len(context_items)} step(s). "
+            f"Reduce _BATCH_SIZE."
+        )
 
-    plans: list[ActionPlan] = []
-    for item in parsed:
-        plans.append(ActionPlan.model_validate(item))
-    return plans
+    raw = _strip_fences(response.content)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Agent planner batch {batch_num}/{total_batches} returned invalid JSON: {e}\n"
+            f"Response length: {len(raw)} chars, stop_reason={response.stop_reason!r}\n"
+            f"Tail of response (last 500 chars):\n{raw[-500:]}"
+        ) from e
+
+    return [ActionPlan.model_validate(item) for item in parsed]
 
 
 def _strip_fences(text: str) -> str:

@@ -30,20 +30,33 @@ class VLLMClient:
             kwargs["tool_choice"] = "auto"
 
         response = self._client.chat.completions.create(**kwargs)
-        choice = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
 
         tool_calls = []
-        if choice.tool_calls:
+        if message.tool_calls:
             tool_calls = [
                 {
                     "id": tc.id,
                     "name": tc.function.name,
                     "arguments": tc.function.arguments,
                 }
-                for tc in choice.tool_calls
+                for tc in message.tool_calls
             ]
 
-        return LLMResponse(content=choice.content or "", tool_calls=tool_calls)
+        # Normalize OpenAI finish_reason vocabulary to Anthropic's
+        _STOP_REASON_MAP = {
+            "stop":       "end_turn",
+            "length":     "max_tokens",
+            "tool_calls": "tool_use",
+        }
+        stop_reason = _STOP_REASON_MAP.get(choice.finish_reason or "", choice.finish_reason)
+
+        return LLMResponse(
+            content=message.content or "",
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+        )
 
     def stream(
         self,

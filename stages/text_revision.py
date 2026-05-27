@@ -15,6 +15,9 @@ Tools available:
 
 import json
 import re
+from pathlib import Path
+
+from pydantic import ValidationError
 
 from llm.client import LLMClient
 from schemas.eco import ECO
@@ -70,13 +73,28 @@ def run(
     steps: list[Step],
     ecos: list[ECO],
     llm: LLMClient,
+    checkpoint_dir: str | Path | None = None,
 ) -> list[RevisedStep]:
+    """Revise each affected step's prose against its ECO.
+
+    When ``checkpoint_dir`` is provided, each completed revision is written
+    to disk so a mid-stage failure (network drop, single-step crash, manual
+    ctrl-C) doesn't throw away the prior revisions. Each call to the model
+    in ``_run_revision_loop`` takes several seconds with tool use; on a
+    300+ step diff that's many minutes of saved work per restart.
+    """
+    ckpt = Path(checkpoint_dir) if checkpoint_dir else None
+    if ckpt is not None:
+        ckpt.mkdir(parents=True, exist_ok=True)
+
     eco_map = {eco.eco_id: eco for eco in ecos}
     step_map = {s.step_id: s for s in steps}
 
     revised: list[RevisedStep] = []
-    for plan in action_plans:
+    for plan_idx, plan in enumerate(action_plans):
         if plan.action == "no_change":
+            # no_change revisions are cheap to construct (no LLM call), so
+            # checkpointing them adds I/O without saving any meaningful work.
             original = step_map[plan.step_id]
             revised.append(
                 RevisedStep(
@@ -91,10 +109,51 @@ def run(
 
         eco = eco_map[plan.eco_id]
         original_step = step_map.get(plan.step_id)
-        result = _run_revision_loop(plan, eco, original_step, llm)
+        result = _load_or_revise(plan, plan_idx, eco, original_step, llm, ckpt)
         revised.append(result)
 
     return revised
+
+
+def _plan_slug(plan: ActionPlan) -> str:
+    safe_step = re.sub(r"[^A-Za-z0-9_-]+", "_", plan.step_id.strip().lower()).strip("_") or "step"
+    safe_eco  = re.sub(r"[^A-Za-z0-9_-]+", "_", plan.eco_id.strip().lower()).strip("_") or "eco"
+    return f"{safe_step}__{safe_eco}"
+
+
+def _load_or_revise(
+    plan: ActionPlan,
+    plan_idx: int,
+    eco: ECO,
+    original_step: Step | None,
+    llm: LLMClient,
+    ckpt: Path | None,
+) -> RevisedStep:
+    if ckpt is not None:
+        path = ckpt / f"plan_{plan_idx:04d}_{_plan_slug(plan)}.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                cached = RevisedStep.model_validate(data)
+                print(f"  Stage 4: plan {plan_idx + 1} ({plan.step_id}) loaded from checkpoint")
+                return cached
+            except (json.JSONDecodeError, ValidationError) as e:
+                # Corrupt checkpoint (partial write, schema drift) — re-run
+                # the revision rather than crash. Removes the file so the
+                # fresh result can be written cleanly below.
+                print(f"  Stage 4: plan {plan_idx + 1} cache rejected ({type(e).__name__}), re-running")
+                path.unlink(missing_ok=True)
+
+    result = _run_revision_loop(plan, eco, original_step, llm)
+
+    if ckpt is not None:
+        path = ckpt / f"plan_{plan_idx:04d}_{_plan_slug(plan)}.json"
+        path.write_text(
+            json.dumps(result.model_dump(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"  Stage 4: plan {plan_idx + 1} ({plan.step_id}) revised + checkpointed")
+    return result
 
 
 def _run_revision_loop(
@@ -109,7 +168,14 @@ def _run_revision_loop(
     messages = [{"role": "user", "content": user_content}]
 
     for _ in range(_MAX_LOOP_ITERATIONS):
-        response = llm.complete(messages=messages, system=_SYSTEM_PROMPT, tools=_TOOLS)
+        # 8K is enough for one revised step (body text + flags + reasoning).
+        # Set explicitly so future default changes don't silently degrade.
+        response = llm.complete(
+            messages=messages,
+            system=_SYSTEM_PROMPT,
+            tools=_TOOLS,
+            max_tokens=8192,
+        )
 
         if response.has_tool_calls:
             messages.append({"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls})
@@ -123,20 +189,48 @@ def _run_revision_loop(
                 })
             continue
 
+        # A truncated response can't contain valid final JSON — fall through
+        # to the re-prompt branch (don't even bother trying to parse). The
+        # outer loop's max-iterations fallback eventually surrenders with a
+        # low-confidence step if the model keeps overflowing.
+        if response.truncated:
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": "Your previous response was truncated. Please output ONLY the final JSON object, more compactly.",
+            })
+            continue
+
         # No tool calls — expect final JSON output
         parsed = _parse_revision_output(response.content)
         if parsed:
             placeholder_step = original_step or _make_placeholder_step(plan.step_id)
-            return RevisedStep(
-                step_id=plan.step_id,
-                original_step=placeholder_step,
-                revised_body_text=parsed["revised_body_text"],
-                confidence=parsed.get("confidence", "low"),
-                flags=parsed.get("flags", []),
-                revision_source=eco.eco_id,
-                needs_manual_view=plan.needs_manual_view,
-                is_new_step=is_new,
-            )
+            try:
+                return RevisedStep(
+                    step_id=plan.step_id,
+                    original_step=placeholder_step,
+                    revised_body_text=parsed["revised_body_text"],
+                    confidence=parsed.get("confidence", "low"),
+                    flags=parsed.get("flags", []),
+                    revision_source=eco.eco_id,
+                    needs_manual_view=plan.needs_manual_view,
+                    is_new_step=is_new,
+                )
+            except ValidationError as e:
+                # One bad field (e.g. confidence="bad-value", flags=non-list)
+                # shouldn't tank the whole stage. Re-prompt so the model can
+                # correct itself; the max-iterations fallback catches it
+                # otherwise.
+                print(f"  Step {plan.step_id}: revision rejected by schema ({e.error_count()} error(s)), re-prompting")
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your JSON failed schema validation. Re-emit the final "
+                        "JSON with valid values for all fields."
+                    ),
+                })
+                continue
 
         # Model returned non-JSON — prompt it to produce the output format
         messages.append({"role": "assistant", "content": response.content})
@@ -199,16 +293,27 @@ def _build_initial_message(
 
 
 def _parse_revision_output(content: str) -> dict | None:
+    """Return a parsed revision dict ONLY if it has a usable revised_body_text.
+
+    Models occasionally emit ``{"revised_body_text": null, ...}`` when they
+    can't produce a revision but still want to return the JSON shape. That
+    null then crashes Pydantic downstream. Treating it as a parse failure
+    sends the loop back to its re-prompt branch, giving the model another
+    chance to produce real text before the max-iterations fallback kicks in.
+    """
     content = content.strip()
     content = re.sub(r"^```[a-z]*\n?", "", content)
     content = re.sub(r"\n?```$", "", content)
     try:
         result = json.loads(content)
-        if "revised_body_text" in result:
-            return result
     except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+        return None
+    if not isinstance(result, dict):
+        return None
+    body = result.get("revised_body_text")
+    if not isinstance(body, str) or not body.strip():
+        return None
+    return result
 
 
 def _make_placeholder_step(step_id: str) -> Step:

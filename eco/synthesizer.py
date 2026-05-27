@@ -32,15 +32,42 @@ def synthesize_ecos(before_path: str, after_path: str) -> list[ECO]:
         return _property_diff(before_path, after_path)
 
 
+_SW_DOC_TYPE = {".SLDPRT": 1, ".SLDASM": 2, ".SLDDRW": 3}  # swDocPART / swDocASSEMBLY / swDocDRAWING
+
+
 def _com_diff(before_path: str, after_path: str) -> list[ECO]:
-    """Full diff via SolidWorks COM API — Windows only."""
-    import win32com.client  # type: ignore
+    """Shallow diff via SolidWorks COM API — Windows only.
+
+    Reads the top-level document's custom properties from each file.  This
+    is the local-synthesizer fallback for when the bridge is unreachable;
+    it does NOT walk the component tree like the bridge's /diff endpoint
+    does, so for assemblies it will only surface assembly-level property
+    changes (not per-component geometry diffs).
+    """
+    import win32com.client            # type: ignore
+    import pythoncom                   # type: ignore
+    from win32com.client import VARIANT  # type: ignore
 
     sw = win32com.client.Dispatch("SldWorks.Application")
     sw.Visible = False
 
-    before_doc = sw.OpenDoc6(before_path, 1, 1, "", 0, 0)
-    after_doc = sw.OpenDoc6(after_path, 1, 1, "", 0, 0)
+    # OpenDoc6 requires an absolute path AND the correct document type for
+    # the file extension — passing swDocPART for a .SLDASM raises a COM
+    # "Type mismatch" before the doc is even loaded.
+    before_abs = str(Path(before_path).resolve())
+    after_abs  = str(Path(after_path).resolve())
+    before_type = _SW_DOC_TYPE.get(Path(before_abs).suffix.upper(), 1)
+    after_type  = _SW_DOC_TYPE.get(Path(after_abs).suffix.upper(),  1)
+
+    # Late-bound OpenDoc6 needs VT_BYREF | VT_I4 for the Errors/Warnings
+    # out-params — passing bare integers raises "Type mismatch" on param 5.
+    def _open(path: str, dtype: int):
+        errors   = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        return sw.OpenDoc6(path, dtype, 1, "", errors, warnings)
+
+    before_doc = _open(before_abs, before_type)
+    after_doc  = _open(after_abs,  after_type)
 
     ecos: list[ECO] = []
 
@@ -110,40 +137,95 @@ def _property_diff(before_path: str, after_path: str) -> list[ECO]:
     return ecos
 
 
-def _folder_part_refs(sldasm_path: str) -> set[str]:
-    """Return the set of SLD* filenames in the same directory as the assembly."""
+def _part_fingerprint(file_path: Path) -> str:
+    """Return a stable identity for a part file.
+
+    A pure rename (filename changes, geometry doesn't) must collapse to a
+    single fingerprint so the set diff sees "no change." Preference order:
+      1. OLE Subject field — convention many CAD shops use for canonical
+         "Part Number" custom property
+      2. SHA-1 of file bytes — collapses true renames even when the OLE
+         property is empty
+      3. Filename — final fallback if the file can't be opened
+    """
+    try:
+        import olefile  # type: ignore
+        if olefile.isOleFile(str(file_path)):
+            with olefile.OleFileIO(str(file_path)) as ole:
+                if ole.exists("\x05SummaryInformation"):
+                    si = ole.get_metadata()
+                    if si.subject:
+                        pn = si.subject.decode("utf-8", errors="ignore").strip()
+                        if pn:
+                            return f"pn:{pn}"
+    except Exception:
+        pass
+
+    try:
+        h = hashlib.sha1()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return f"sha1:{h.hexdigest()}"
+    except Exception:
+        return f"name:{file_path.name.upper()}"
+
+
+def _folder_part_map(sldasm_path: str) -> dict[str, str]:
+    """Map fingerprint -> filename for SLD* files alongside the assembly.
+
+    If two files share a fingerprint (true duplicates) the first one
+    encountered wins. Filename is preserved so add/remove ECOs still
+    report a human-readable name.
+    """
     exts = {".SLDPRT", ".SLDASM"}
-    return {
-        f.name.upper()
-        for f in Path(sldasm_path).parent.iterdir()
-        if f.suffix.upper() in exts
-    }
+    out: dict[str, str] = {}
+    for f in Path(sldasm_path).parent.iterdir():
+        if f.suffix.upper() not in exts:
+            continue
+        out.setdefault(_part_fingerprint(f), f.name)
+    return out
 
 
 def _part_ref_diff(before_path: str, after_path: str) -> list[ECO]:
-    before_refs = _folder_part_refs(before_path)
-    after_refs = _folder_part_refs(after_path)
+    before_map = _folder_part_map(before_path)
+    after_map = _folder_part_map(after_path)
 
-    added = after_refs - before_refs
-    removed = before_refs - after_refs
+    before_fps = set(before_map)
+    after_fps = set(after_map)
+
+    added_fps   = after_fps - before_fps
+    removed_fps = before_fps - after_fps
 
     ecos: list[ECO] = []
-    for part in sorted(added):
-        eco_id = _make_eco_id(before_path, part)
+    for fp in sorted(added_fps):
+        name = after_map[fp]
+        eco_id = _make_eco_id(before_path, name)
         ecos.append(ECO(
             eco_id=eco_id,
-            part_number=Path(part).stem,
-            changes=[ECOChange(field="part", old="", new=part)],
-            summary=f"Part added to assembly: {part}",
+            part_number=Path(name).stem,
+            changes=[ECOChange(field="part", old="", new=name)],
+            summary=f"Part added to assembly: {name}",
         ))
-    for part in sorted(removed):
-        eco_id = _make_eco_id(before_path, part)
+    for fp in sorted(removed_fps):
+        name = before_map[fp]
+        eco_id = _make_eco_id(before_path, name)
         ecos.append(ECO(
             eco_id=eco_id,
-            part_number=Path(part).stem,
-            changes=[ECOChange(field="part", old=part, new="")],
-            summary=f"Part removed from assembly: {part}",
+            part_number=Path(name).stem,
+            changes=[ECOChange(field="part", old=name, new="")],
+            summary=f"Part removed from assembly: {name}",
         ))
+
+    # Renames (same fingerprint, different filename) are not ECOs — geometry
+    # didn't change. Log them so the user can see why a filename diff was
+    # suppressed instead of silently dropping evidence.
+    for fp in sorted(before_fps & after_fps):
+        before_name = before_map[fp]
+        after_name  = after_map[fp]
+        if before_name != after_name:
+            print(f"  [synthesizer] rename suppressed (same fingerprint): {before_name} -> {after_name}")
+
     return ecos
 
 
