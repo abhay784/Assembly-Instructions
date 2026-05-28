@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ECO {{ report.eco_id }} — {{ report.document_id }}</title>
+<style>
+  body { font-family: "Helvetica Neue", Arial, sans-serif; color: #222; margin: 32px; font-size: 11pt; }
+  h1 { font-size: 20pt; margin: 0 0 4px 0; }
+  h2 { font-size: 13pt; margin: 24px 0 8px 0; border-bottom: 1px solid #999; padding-bottom: 2px; }
+  .meta { color: #555; font-size: 10pt; margin-bottom: 16px; }
+  .meta b { color: #222; }
+  .summary { background: #f4f4f4; padding: 10px 14px; border-left: 4px solid #2266aa; margin-bottom: 18px; }
+  table.changes { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+  table.changes th, table.changes td {
+    border: 1px solid #bbb; padding: 6px 8px; vertical-align: top; text-align: left;
+  }
+  table.changes th { background: #eee; }
+  td.was { background: #fff4f4; }
+  td.is  { background: #f0fbf2; }
+  td.field { font-family: "Menlo", "Consolas", monospace; font-size: 9pt; color: #444; }
+  td.where { font-size: 9pt; color: #333; }
+  td.where .neighbors { color: #777; font-size: 8.5pt; }
+  span.sev-CRITICAL { color: #fff; background: #c1272d; padding: 1px 6px; border-radius: 3px; font-size: 8.5pt; }
+  span.sev-MAJOR    { color: #fff; background: #e07700; padding: 1px 6px; border-radius: 3px; font-size: 8.5pt; }
+  span.sev-MINOR    { color: #fff; background: #5a8db8; padding: 1px 6px; border-radius: 3px; font-size: 8.5pt; }
+  span.sev-UNCERTAIN{ color: #fff; background: #777;   padding: 1px 6px; border-radius: 3px; font-size: 8.5pt; }
+  .attachments { font-size: 10pt; margin-top: 18px; }
+  .attachments li { margin: 2px 0; }
+</style>
+</head>
+<body>
+
+<h1>Engineering Change Order</h1>
+<div class="meta">
+  <b>ECO ID:</b> {{ report.eco_id }} &nbsp;|&nbsp;
+  <b>Document:</b> {{ report.document_id }} &nbsp;|&nbsp;
+  <b>Scenario:</b> {{ report.scenario }} &nbsp;|&nbsp;
+  <b>Source:</b> {{ report.source }} &nbsp;|&nbsp;
+  <b>Generated:</b> {{ generated_at }}
+</div>
+
+<div class="summary">{{ report.summary }}</div>
+
+<h2>Changes ({{ report.changes | length }})</h2>
+
+{% if report.changes %}
+<table class="changes">
+  <thead>
+    <tr>
+      <th style="width: 18%;">Where</th>
+      <th style="width: 14%;">Field</th>
+      <th style="width: 18%;">Was</th>
+      <th style="width: 18%;">Is</th>
+      <th style="width: 8%;">Severity</th>
+      <th>Rationale</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in report.changes %}
+    <tr>
+      <td class="where">
+        {% if c.location and c.location.zone %}
+          <b>Zone {{ c.location.zone }}</b>
+        {% elif c.location and c.location.tree_path %}
+          {{ c.location.tree_path }}
+          {% if c.location.mate_neighbors %}
+            <div class="neighbors">mated: {{ c.location.mate_neighbors | join(", ") }}</div>
+          {% endif %}
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td class="field">
+        {{ c.field }}
+        {% if c.change_type %}<br><span style="color:#666">{{ c.change_type }}</span>{% endif %}
+      </td>
+      <td class="was">{{ c.old or "—" }}</td>
+      <td class="is">{{ c.new or "—" }}</td>
+      <td><span class="sev-{{ c.severity }}">{{ c.severity }}</span></td>
+      <td>{{ c.rationale or "" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>No changes detected.</em></p>
+{% endif %}
+
+{% if report.attachments %}
+<h2>Attachments</h2>
+<ul class="attachments">
+{% for path in report.attachments %}
+  <li>{{ path }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+
+</body>
+</html>

@@ -1296,6 +1296,62 @@ def _folder_assembly_diff(before_path: str, after_path: str) -> dict:
     }
 
 
+class SldDrwToPdfRequest(BaseModel):
+    drawing_path: str
+    out_pdf_path: str
+
+
+@app.post("/slddrw_to_pdf")
+def slddrw_to_pdf(req: SldDrwToPdfRequest):
+    """
+    Open a SolidWorks drawing (.SLDDRW) and SaveAs PDF.
+
+    Used by the ECO pipeline (Scenario A) to normalize drawing inputs so the
+    PDF-vs-PDF diff path can consume them without requiring the user to
+    pre-convert. Reuses the same SldWorks COM connection as /diff.
+
+    Response: {"pdf_path": str}
+    """
+    if not _use_sw_for_diff():
+        raise HTTPException(503, "SolidWorks COM unavailable — /slddrw_to_pdf requires SldWorks")
+    try:
+        return {"pdf_path": _com_slddrw_to_pdf(req.drawing_path, req.out_pdf_path)}
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+def _com_slddrw_to_pdf(drawing_path: str, out_pdf_path: str) -> str:
+    import pythoncom  # type: ignore
+    pythoncom.CoInitialize()
+
+    sw = _sw_app
+    if sw is None:
+        raise RuntimeError("SldWorks COM application not initialized")
+
+    if not Path(drawing_path).exists():
+        raise FileNotFoundError(f"Drawing not found: {drawing_path}")
+    if Path(drawing_path).suffix.lower() != ".slddrw":
+        raise ValueError(f"Expected .SLDDRW, got {Path(drawing_path).suffix}")
+
+    Path(out_pdf_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # swDocDRAWING = 3
+    doc = _open_doc6(sw, drawing_path, 3)
+    try:
+        # SaveAs returns True on success in most pywin32 builds, though some
+        # late-bound variants return a tuple. Coerce to bool.
+        ok = doc.SaveAs(out_pdf_path)
+        ok = bool(ok[0]) if isinstance(ok, tuple) else bool(ok)
+        if not ok or not Path(out_pdf_path).exists():
+            raise RuntimeError(f"SaveAs PDF failed for {drawing_path}")
+        return out_pdf_path
+    finally:
+        try:
+            sw.CloseDoc(Path(drawing_path).name)
+        except Exception:
+            pass
+
+
 class AuthorViewRequest(BaseModel):
     view_id: str
     azimuth: float

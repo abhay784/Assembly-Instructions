@@ -109,6 +109,23 @@ class ComposerClient:
             raise RuntimeError(f"Bridge /extract_assembly failed (HTTP {resp.status_code}): {detail}")
         return resp.json()
 
+    def slddrw_to_pdf(self, drawing_path: str, out_pdf_path: str) -> str:
+        """Convert a .SLDDRW to PDF via SolidWorks SaveAs. Returns the PDF path."""
+        abs_drw = str(Path(drawing_path).resolve())
+        abs_pdf = str(Path(out_pdf_path).resolve())
+        resp = self._client.post(
+            "/slddrw_to_pdf",
+            json={"drawing_path": abs_drw, "out_pdf_path": abs_pdf},
+            timeout=120.0,
+        )
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"Bridge /slddrw_to_pdf failed (HTTP {resp.status_code}): {detail}")
+        return resp.json()["pdf_path"]
+
     def author_view(self, view_id: str, azimuth: float, elevation: float) -> dict:
         """Set camera angle for a view (azimuth, elevation in degrees)."""
         resp = self._client.post(
