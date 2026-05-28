@@ -101,6 +101,8 @@ def sw_diff_to_ecos(diff: dict) -> list[ECO]:
     # ── Changed components — properties + geometry + dimensions + faces ────────
     for comp in diff.get("components_changed", []):
         name        = comp["name"]
+        name_before = comp.get("name_before")  # only present on rename pairs
+        rename_match = comp.get("_rename_match")
         part_number = Path(name).stem
         changes: list[ECOChange] = []
 
@@ -184,14 +186,17 @@ def sw_diff_to_ecos(diff: dict) -> list[ECO]:
         if len(changes) > 6:
             prop_strs.append(f"… +{len(changes)-6} more")
 
+        if name_before:
+            header = (f"[{source}] Part modified (renamed via {rename_match}): "
+                      f"{name_before} → {name} ({detail_str}). ")
+        else:
+            header = f"[{source}] Part modified: {name} ({detail_str}). "
+
         ecos.append(ECO(
             eco_id=_make_eco_id(before_path, name),
             part_number=part_number,
             changes=changes,
-            summary=(
-                f"[{source}] Part modified: {name} ({detail_str}). "
-                f"{'; '.join(prop_strs)}"
-            ),
+            summary=header + "; ".join(prop_strs),
         ))
 
     # ── Mate changes — one consolidated ECO for all added/removed mates ───────

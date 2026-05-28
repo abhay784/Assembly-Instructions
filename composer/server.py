@@ -1051,6 +1051,224 @@ def _open_doc6(sw, path: str, doc_type: int):
     return doc
 
 
+# ---------------------------------------------------------------------------
+# Rename reconciliation — collapse "filename(R2) removed + filename(R3) added"
+# into a single component_changed entry.
+#
+# Layered identity (each layer is only consulted when stronger evidence is
+# absent):
+#   1. Canonical custom property "Part Number" (and common spellings).
+#   2. Normalized filename stem (rev suffixes stripped) gated by mass similarity.
+#
+# Both layers are conservative: matches must be 1:1 and (for layer 2) within
+# ±50% mass to avoid wrongly merging different parts that happen to share a
+# generic stem like "plate". Anything that survives both layers stays in the
+# add/remove lists.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_REV_SUFFIX_RE = _re.compile(
+    r"(\(R\d+\)|\(REV[_ ]?[A-Z0-9]+\)|_R\d+|_REV[_ ]?[A-Z0-9]+|_v\d+|-R\d+)$",
+    _re.IGNORECASE,
+)
+
+
+def _normalize_stem(filename: str) -> str:
+    """Strip trailing revision suffixes from a filename stem.
+
+    Examples (case-insensitive):
+      BRACKET(R2).SLDPRT  -> BRACKET
+      BRACKET_REV_B.SLDPRT -> BRACKET
+      BRACKET_v3.SLDPRT   -> BRACKET
+      BRACKET.SLDPRT      -> BRACKET (no change)
+    """
+    stem = Path(filename).stem
+    for _ in range(3):  # peel up to 3 stacked suffixes, e.g. "FOO_R2(R3)"
+        new = _REV_SUFFIX_RE.sub("", stem)
+        if new == stem:
+            break
+        stem = new
+    return stem.upper()
+
+
+def _canonical_id(comp_data: dict) -> str | None:
+    """Return the part's authoritative ID from custom properties, or None.
+
+    Looks across common spellings of the "Part Number" property — many CAD
+    shops set this once and rev the file independently, so two files with
+    the same Part Number are by convention the same part.
+
+    Case-insensitive on both the key and the value so this works whether or
+    not the caller has already lowercased the property keys (the bridge's
+    _read_component_data does; hand-built dicts may not).
+    """
+    props = comp_data.get("properties", {}) or {}
+    targets = {"part number", "partnumber", "part_number", "partno", "part no"}
+    for k, v in props.items():
+        if str(k).lower() in targets:
+            s = str(v).strip()
+            if s:
+                return s.upper()
+    return None
+
+
+def _mass_similar(m_before, m_after, tolerance: float = 0.5) -> bool:
+    """True if two masses are similar enough to plausibly be a rev of one part.
+
+    Uses mean-relative drift (|a-b| / mean) so 1 kg vs 2 kg → ratio 0.67 and
+    is rejected at the default 50% tolerance — a doubled mass is almost
+    certainly a different part. None on either side → True (don't block the
+    match on missing data).
+    """
+    if m_before is None or m_after is None:
+        return True
+    if m_before == 0 and m_after == 0:
+        return True
+    mean = (abs(m_before) + abs(m_after)) / 2
+    if mean == 0:
+        return True
+    return abs(m_before - m_after) / mean <= tolerance
+
+
+def _reconcile_renames(
+    added: list[dict],
+    removed: list[dict],
+    before_comps: dict[str, dict],
+    after_comps: dict[str, dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Pull renamed-component pairs out of added/removed and return them as
+    extra `components_changed` entries.
+
+    Returns (added_filtered, removed_filtered, extra_changed). Each rename
+    pair becomes one entry in extra_changed with:
+      • name           — the new filename (after rev)
+      • name_before    — the old filename
+      • property_changes including {"property": "filename", ...}
+      • geometry_changes from the shallow mass/volume/area comparison
+      • dimension_changes / face_changes empty — Phase 3 will populate
+      • _rename_match — "part_number" or "filename_stem" (diagnostic)
+    """
+    # ── Layer 1: match by Part Number custom property ────────────────────────
+    added_by_pn: dict[str, list[dict]] = {}
+    removed_by_pn: dict[str, list[dict]] = {}
+    added_unmatched: list[dict] = []
+    removed_unmatched: list[dict] = []
+
+    for a in added:
+        pn = _canonical_id(after_comps.get(a["name"], {}))
+        if pn:
+            added_by_pn.setdefault(pn, []).append(a)
+        else:
+            added_unmatched.append(a)
+    for r in removed:
+        pn = _canonical_id(before_comps.get(r["name"], {}))
+        if pn:
+            removed_by_pn.setdefault(pn, []).append(r)
+        else:
+            removed_unmatched.append(r)
+
+    rename_pairs: list[tuple[dict, dict, str]] = []  # (removed, added, reason)
+    for pn, a_list in list(added_by_pn.items()):
+        r_list = removed_by_pn.get(pn, [])
+        n_pair = min(len(a_list), len(r_list))
+        if len(a_list) > 1 or len(r_list) > 1:
+            print(f"  rename reconcile: Part Number {pn!r} matched "
+                  f"{len(r_list)} removed × {len(a_list)} added — pairing first {n_pair}")
+        for a, r in zip(a_list[:n_pair], r_list[:n_pair]):
+            rename_pairs.append((r, a, "part_number"))
+        added_unmatched.extend(a_list[n_pair:])
+        removed_by_pn[pn] = r_list[n_pair:]
+    for pn, r_list in removed_by_pn.items():
+        removed_unmatched.extend(r_list)
+
+    # ── Layer 2: normalized filename stem + mass sanity gate ─────────────────
+    stem_added: dict[str, list[dict]] = {}
+    stem_removed: dict[str, list[dict]] = {}
+    for a in added_unmatched:
+        stem_added.setdefault(_normalize_stem(a["name"]), []).append(a)
+    for r in removed_unmatched:
+        stem_removed.setdefault(_normalize_stem(r["name"]), []).append(r)
+
+    added_final: list[dict] = []
+    removed_final: list[dict] = []
+    consumed_added: set[int] = set()
+    consumed_removed: set[int] = set()
+
+    for stem, a_list in stem_added.items():
+        r_list = stem_removed.get(stem, [])
+        if not r_list:
+            continue
+        if stem == "":
+            continue  # empty stem after stripping is too weak a signal
+        for a in a_list:
+            for r in r_list:
+                if id(r) in consumed_removed:
+                    continue
+                m_after = after_comps.get(a["name"], {}).get("mass_kg")
+                m_before = before_comps.get(r["name"], {}).get("mass_kg")
+                if not _mass_similar(m_before, m_after):
+                    continue
+                rename_pairs.append((r, a, "filename_stem"))
+                consumed_added.add(id(a))
+                consumed_removed.add(id(r))
+                break
+
+    for a in added_unmatched:
+        if id(a) not in consumed_added:
+            added_final.append(a)
+    for r in removed_unmatched:
+        if id(r) not in consumed_removed:
+            removed_final.append(r)
+
+    # ── Build the `components_changed` entries for each pair ─────────────────
+    extra_changed: list[dict] = []
+    for r, a, reason in rename_pairs:
+        before_data = before_comps.get(r["name"], {})
+        after_data  = after_comps.get(a["name"], {})
+
+        prop_changes: list[dict] = [{
+            "property": "filename",
+            "before":   r["name"],
+            "after":    a["name"],
+        }]
+        if r.get("quantity", 1) != a.get("quantity", 1):
+            prop_changes.append({
+                "property": "quantity",
+                "before":   str(r.get("quantity", 1)),
+                "after":    str(a.get("quantity", 1)),
+            })
+        for prop in sorted(
+            set(before_data.get("properties", {})) | set(after_data.get("properties", {}))
+        ):
+            bv = str(before_data.get("properties", {}).get(prop, ""))
+            av = str(after_data.get("properties", {}).get(prop, ""))
+            if bv != av:
+                prop_changes.append({"property": prop, "before": bv, "after": av})
+
+        geo_changes: list[dict] = []
+        for k, thresh in [("mass_kg", 1e-4), ("volume_m3", 1e-8), ("surface_area_m2", 1e-6)]:
+            bv_f = before_data.get(k)
+            av_f = after_data.get(k)
+            if bv_f is not None and av_f is not None and abs(bv_f - av_f) > thresh:
+                geo_changes.append({"property": k, "before": str(bv_f), "after": str(av_f)})
+
+        extra_changed.append({
+            "name":              a["name"],
+            "name_before":       r["name"],
+            "quantity_before":   r.get("quantity", 1),
+            "quantity_after":    a.get("quantity", 1),
+            "property_changes":  prop_changes,
+            "geometry_changes":  geo_changes,
+            "dimension_changes": [],  # populated by Phase 3
+            "face_changes":      [],
+            "_rename_match":     reason,
+        })
+        print(f"  rename reconciled ({reason}): {r['name']} -> {a['name']}")
+
+    return added_final, removed_final, extra_changed
+
+
 def _com_assembly_diff(before_path: str, after_path: str) -> dict:
     """
     Full assembly diff via SolidWorks COM (SldWorks.Application).
@@ -1074,7 +1292,9 @@ def _com_assembly_diff(before_path: str, after_path: str) -> dict:
         "components_removed": [{"name", "quantity"}],
         "components_changed": [{
             "name", "quantity_before", "quantity_after",
-            "property_changes":  [{"property", "before", "after"}],
+            "name_before",                      # only present on rename pairs
+            "_rename_match",                    # "part_number" | "filename_stem"
+            "property_changes":  [{"property", "before", "after"}],   # includes filename row on renames
             "geometry_changes":  [{"property", "before", "after"}],
             "dimension_changes": [{"dimension", "before", "after", "unit"}],
             "face_changes":      [{"surface_type", "change", ...}],
@@ -1223,6 +1443,17 @@ def _com_assembly_diff(before_path: str, after_path: str) -> dict:
     mates_removed = [{"name": n, "type": t}
                      for n, t in sorted(before_mate_keys - after_mate_keys)]
 
+    # ── Phase 2.5: reconcile renames (filename(R2) → filename(R3)) ───────────
+    # Pull rename pairs out of added/removed and re-classify them as changed
+    # so downstream consumers see a single "Part modified" ECO instead of
+    # bogus add+remove pairs that are actually the same physical part.
+    added, removed, renamed_changed = _reconcile_renames(
+        added, removed, before_comps, after_comps,
+    )
+    if renamed_changed:
+        print(f"  SW diff phase 2.5: {len(renamed_changed)} rename(s) reconciled")
+    changed.extend(renamed_changed)
+
     # ── Phase 3: deep geometric diff on flagged parts only ───────────────────
     #
     # A part is flagged for deep analysis if:
@@ -1232,25 +1463,34 @@ def _com_assembly_diff(before_path: str, after_path: str) -> dict:
     #
     # Parts that are purely added or removed don't need deep analysis.
 
+    def _before_key(entry: dict) -> str:
+        # Renamed entries store the old filename under "name_before"; everyone
+        # else uses "name" on both sides.
+        return entry.get("name_before") or entry["name"]
+
     deep_candidates = [
         entry for entry in changed
-        if entry["geometry_changes"]                                       # (a)
-        or (before_comps[entry["name"]]["mass_kg"] is None                 # (b)
-            and after_comps[entry["name"]]["mass_kg"] is None)
+        if entry["geometry_changes"]                                          # (a)
+        or entry.get("_rename_match")                                         # always deep-diff renames
+        or (before_comps.get(_before_key(entry), {}).get("mass_kg") is None   # (b)
+            and after_comps.get(entry["name"], {}).get("mass_kg") is None)
     ]
 
     print(f"  SW diff phase 2: {len(added)} added, {len(removed)} removed, "
           f"{len(changed)} changed, {len(deep_candidates)} flagged for deep diff")
 
     for entry in deep_candidates:
-        name    = entry["name"]
-        b_path  = before_comps[name].get("actual_path", "")
-        a_path  = after_comps[name].get("actual_path", "")
+        before_name = _before_key(entry)
+        after_name  = entry["name"]
+        b_path  = before_comps.get(before_name, {}).get("actual_path", "")
+        a_path  = after_comps.get(after_name,  {}).get("actual_path", "")
 
         if not b_path or not a_path:
             continue
 
-        print(f"  SW diff phase 3: deep diff → {name}")
+        label = (f"{before_name} → {after_name}"
+                 if entry.get("_rename_match") else after_name)
+        print(f"  SW diff phase 3: deep diff → {label}")
         deep = _deep_part_diff(b_path, a_path, sw)
         entry["dimension_changes"] = deep["dimension_changes"]
         entry["face_changes"]      = deep["face_changes"]
